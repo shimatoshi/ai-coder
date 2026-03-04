@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // ============================================
-// Coding Agent for Termux
+// frog - coding agent for Termux
 // Zero dependencies. Gemini OAuth + API key.
 // ============================================
 
@@ -52,7 +52,7 @@ const MAX_TOOL_LOOPS = 30;
 let CWD = process.cwd();
 
 // ====== Auth Storage ======
-const AUTH_DIR = join(homedir(), ".ai-coder");
+const AUTH_DIR = join(homedir(), ".frog");
 const AUTH_FILE = join(AUTH_DIR, "auth.json");
 
 function loadAuth() {
@@ -602,6 +602,52 @@ const TOOL_MAP = {
   search_text: toolSearchText,
 };
 
+// ====== Hooks System (japanese-developer compatible) ======
+const HOOKS_FILE = join(homedir(), ".frog", "hooks.json");
+let hooksConfig = null;
+
+function loadHooks() {
+  try {
+    if (existsSync(HOOKS_FILE)) {
+      hooksConfig = JSON.parse(readFileSync(HOOKS_FILE, "utf-8"));
+    }
+  } catch {}
+}
+
+function matchesHook(matcher, toolName) {
+  return matcher.split("|").some(m => m.trim() === toolName);
+}
+
+async function runHooks(phase, toolName, input) {
+  if (!hooksConfig?.[phase]) return null;
+
+  for (const group of hooksConfig[phase]) {
+    if (group.matcher && !matchesHook(group.matcher, toolName)) continue;
+    for (const hook of group.hooks || []) {
+      if (hook.type !== "command") continue;
+      try {
+        const timeout = hook.timeout || 5000;
+        const payload = JSON.stringify({ tool_name: toolName, tool_input: input });
+        const result = spawnSync("bash", ["-c", hook.command], {
+          input: payload,
+          encoding: "utf-8",
+          timeout,
+          cwd: CWD,
+        });
+        const out = (result.stdout || "").trim();
+        if (!out) continue;
+        const parsed = JSON.parse(out);
+        if (parsed.decision === "deny") {
+          return { denied: true, reason: parsed.reason || "Blocked by hook" };
+        }
+      } catch {}
+    }
+  }
+  return null;
+}
+
+loadHooks();
+
 // ====== Spinner ======
 const SPIN = ["\u28CB", "\u28D9", "\u28F9", "\u28F8", "\u28FC", "\u28F4", "\u28E6", "\u28E7", "\u28C7", "\u28CF"];
 let spinTimer = null;
@@ -1030,10 +1076,23 @@ async function agentTurn(userMessage) {
     for (const part of calls) {
       const { name, args } = part.functionCall;
       process.stdout.write(`\x1b[90m  > ${name}(${fmtArgs(args)})\x1b[0m\n`);
+
+      // BeforeTool hooks
+      const hookResult = await runHooks("BeforeTool", name, args || {});
+      if (hookResult?.denied) {
+        process.stdout.write(`\x1b[33m    ! hook: ${hookResult.reason}\x1b[0m\n`);
+        responses.push({ functionResponse: { name, response: { success: false, error: hookResult.reason } } });
+        continue;
+      }
+
       const result = TOOL_MAP[name] ? await TOOL_MAP[name](args || {}) : { error: `Unknown tool: ${name}` };
       if (result.success === false) {
         process.stdout.write(`\x1b[31m    x ${result.error || "failed"}\x1b[0m\n`);
       }
+
+      // AfterTool hooks
+      await runHooks("AfterTool", name, { input: args || {}, result });
+
       responses.push({ functionResponse: { name, response: result } });
     }
 
@@ -1157,6 +1216,25 @@ function showStatus() {
   }
 }
 
+// ====== Character Width ======
+function isWideChar(char) {
+  const c = char.codePointAt(0);
+  // CJK, Hiragana, Katakana, Hangul, Fullwidth forms
+  return c >= 0x1100 && (
+    c <= 0x115F ||
+    (c >= 0x2E80 && c <= 0x303E) ||
+    (c >= 0x3040 && c <= 0x33BF) ||
+    (c >= 0x3400 && c <= 0x4DBF) ||
+    (c >= 0x4E00 && c <= 0xA4CF) ||
+    (c >= 0xAC00 && c <= 0xD7FF) ||
+    (c >= 0xF900 && c <= 0xFAFF) ||
+    (c >= 0xFE10 && c <= 0xFE6F) ||
+    (c >= 0xFF01 && c <= 0xFF60) ||
+    (c >= 0xFFE0 && c <= 0xFFE6) ||
+    (c >= 0x20000 && c <= 0x3FFFF)
+  );
+}
+
 // ====== Multiline Input (raw stdin) ======
 function readUserInput() {
   return new Promise((resolve) => {
@@ -1205,13 +1283,21 @@ function readUserInput() {
           continue;
         }
 
-        // Backspace
+        // Backspace - delete last character (handles wide chars)
         if (byte === 127 || byte === 8) {
-          if (lines[lines.length - 1].length > 0) {
-            lines[lines.length - 1] = lines[lines.length - 1].slice(0, -1);
-            process.stdout.write("\b \b");
+          const currentLine = lines[lines.length - 1];
+          if (currentLine.length > 0) {
+            const chars = [...currentLine]; // Split by codepoints, not bytes
+            const removed = chars.pop();
+            lines[lines.length - 1] = chars.join("");
+            if (isWideChar(removed)) {
+              process.stdout.write("\b \b\b \b"); // 2 columns
+            } else {
+              process.stdout.write("\b \b"); // 1 column
+            }
           } else if (lines.length > 1) {
             lines.pop();
+            // Redraw previous line
             process.stdout.write("\x1b[A\r\x1b[K\x1b[90m│\x1b[0m " + lines[lines.length - 1]);
           }
           continue;
@@ -1252,7 +1338,7 @@ function readUserInput() {
 
 // ====== Main ======
 async function main() {
-  console.log(`\x1b[36mCoding Agent v0.3\x1b[0m`);
+  console.log(`\x1b[36m🐸 frog v0.4\x1b[0m`);
   console.log(`\x1b[90mModel: ${MODEL} | Dir: ${CWD}\x1b[0m`);
 
   if (isOAuthEnabled()) {
