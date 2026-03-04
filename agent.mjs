@@ -4,7 +4,6 @@
 // Zero dependencies. Gemini OAuth + API key.
 // ============================================
 
-import { createInterface } from "node:readline";
 import {
   readFileSync,
   writeFileSync,
@@ -277,14 +276,7 @@ function isOAuthEnabled() {
 
 // ====== State ======
 let history = [];
-let pasteMode = false;
-let pasteBuffer = [];
 let turnCount = 0;
-let _sseRes = null; // Set during web mode SSE response
-
-function sseWrite(res, data) {
-  try { res.write(`data: ${JSON.stringify(data)}\n\n`); } catch {}
-}
 
 // ====== System Prompt ======
 const getSystemPrompt = () => `You are a coding agent running in a terminal on Android (Termux).
@@ -568,7 +560,6 @@ let spinTimer = null;
 let spinIdx = 0;
 
 function startSpin(msg) {
-  if (_sseRes) return;
   spinIdx = 0;
   spinTimer = setInterval(() => {
     process.stdout.write(`\r\x1b[90m${SPIN[spinIdx++ % SPIN.length]} ${msg}\x1b[0m`);
@@ -752,11 +743,7 @@ async function callGeminiOAuthStream(contents, _retried) {
                 stopSpin();
                 streamingText = true;
               }
-              if (_sseRes) {
-                sseWrite(_sseRes, { type: "text", content: part.text });
-              } else {
-                process.stdout.write(part.text);
-              }
+              process.stdout.write(part.text);
               fullText += part.text;
             } else if (part.functionCall) {
               // Merge buffered thoughtSignature if the part doesn't already have one
@@ -777,7 +764,7 @@ async function callGeminiOAuthStream(contents, _retried) {
     }
   }
 
-  if (streamingText && !_sseRes) process.stdout.write("\n");
+  if (streamingText) process.stdout.write("\n");
 
   // Build final parts
   if (fullText) allParts.unshift({ text: fullText });
@@ -1083,8 +1070,11 @@ function compactHistory() {
 // ====== Commands ======
 function showHelp() {
   console.log(`\x1b[36m
+入力:
+  Enter     改行
+  Ctrl+D    送信
+
 Commands:
-  /paste    複数行入力モード（/end で送信）
   /login    Googleアカウントで認証（1000回/日）
   /logout   認証情報を削除
   /status   認証状態を表示
@@ -1094,9 +1084,6 @@ Commands:
   /model    現在のモデルを表示
   /help     このヘルプを表示
   Ctrl+C    終了
-
-起動オプション:
-  --web     Web UIモードで起動 (http://localhost:3456)
 \x1b[0m`);
 }
 
@@ -1117,240 +1104,89 @@ function showStatus() {
   }
 }
 
-// ====== Web UI ======
-const WEB_PORT = parseInt(process.env.AGENT_WEB_PORT || "3456");
-let webProcessing = false;
+// ====== Multiline Input (raw stdin) ======
+function readUserInput() {
+  return new Promise((resolve) => {
+    process.stdout.write("\x1b[32m> \x1b[0m");
+    const lines = [""];
 
-const WEB_HTML = `<!DOCTYPE html>
-<html lang="ja"><head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
-<title>Coding Agent</title>
-<style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0d1117;color:#e6edf3;height:100dvh;display:flex;flex-direction:column}
-#header{padding:10px 16px;background:#161b22;border-bottom:1px solid #30363d;font-size:13px;color:#8b949e;display:flex;justify-content:space-between;align-items:center}
-#header button{background:none;border:1px solid #30363d;color:#8b949e;border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer}
-#header button:hover{border-color:#8b949e}
-#chat{flex:1;overflow-y:auto;padding:12px 16px;display:flex;flex-direction:column;gap:10px}
-.msg{max-width:88%;padding:10px 14px;font-size:14px;line-height:1.55;word-break:break-word;white-space:pre-wrap}
-.msg.user{align-self:flex-end;background:#1f6feb;border-radius:12px 12px 2px 12px}
-.msg.assistant{align-self:flex-start;background:#161b22;border:1px solid #30363d;border-radius:12px 12px 12px 2px}
-.msg pre{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:8px;overflow-x:auto;font-size:13px;margin:6px 0;white-space:pre}
-.msg code{background:#1c2128;padding:1px 5px;border-radius:3px;font-size:13px}
-.tool{font-size:12px;color:#8b949e;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:5px 10px;align-self:flex-start;max-width:95%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.tool.err{border-color:#f85149;color:#f85149}
-.thinking{color:#8b949e;font-style:italic;font-size:13px;align-self:flex-start}
-#input-area{padding:10px 12px;background:#161b22;border-top:1px solid #30363d;display:flex;gap:8px;align-items:flex-end}
-#msg{flex:1;background:#0d1117;border:1px solid #30363d;border-radius:8px;color:#e6edf3;padding:10px 12px;font-size:15px;resize:none;min-height:48px;max-height:40vh;font-family:inherit;outline:none;line-height:1.4}
-#msg:focus{border-color:#1f6feb}
-#send{background:#238636;color:#fff;border:none;border-radius:8px;padding:12px 20px;font-size:15px;cursor:pointer;white-space:nowrap}
-#send:hover{background:#2ea043}
-#send:disabled{background:#21262d;color:#484f58;cursor:not-allowed}
-</style>
-</head><body>
-<div id="header">
-  <span>Coding Agent &mdash; <span id="model">...</span></span>
-  <button onclick="clearChat()">Clear</button>
-</div>
-<div id="chat"></div>
-<div id="input-area">
-  <textarea id="msg" placeholder="メッセージを入力... (Ctrl+Enter で送信)" rows="2"></textarea>
-  <button id="send" onclick="sendMsg()">送信</button>
-</div>
-<script>
-const chat=document.getElementById('chat'),msgEl=document.getElementById('msg'),sendBtn=document.getElementById('send');
-let sending=false;
-msgEl.addEventListener('input',()=>{msgEl.style.height='auto';msgEl.style.height=Math.min(msgEl.scrollHeight,window.innerHeight*0.4)+'px'});
-msgEl.addEventListener('keydown',e=>{if(e.key==='Enter'&&(e.ctrlKey||e.metaKey)){e.preventDefault();sendMsg()}});
-function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
-function fmt(t){
-  t=t.replace(/\`\`\`(\\w*)\\n([\\s\\S]*?)\`\`\`/g,(_,l,c)=>'<pre><code>'+esc(c.trim())+'</code></pre>');
-  t=t.replace(/\`([^\`]+)\`/g,(_, c)=>'<code>'+esc(c)+'</code>');
-  t=t.replace(/\\*\\*(.+?)\\*\\*/g,'<strong>$1</strong>');
-  return t;
-}
-function addEl(cls,html){const d=document.createElement('div');d.className=cls;d.innerHTML=html;chat.appendChild(d);chat.scrollTop=chat.scrollHeight;return d}
-function scroll(){chat.scrollTop=chat.scrollHeight}
-async function clearChat(){
-  await fetch('/api/clear',{method:'POST'});
-  chat.innerHTML='';
-}
-async function sendMsg(){
-  if(sending)return;
-  const text=msgEl.value;
-  if(!text.trim())return;
-  sending=true;sendBtn.disabled=true;
-  msgEl.value='';msgEl.style.height='auto';
-  addEl('msg user',esc(text));
-  const aDiv=addEl('msg assistant','<span class="thinking">thinking...</span>');
-  let full='';
-  try{
-    const res=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:text})});
-    const reader=res.body.getReader();
-    const dec=new TextDecoder();
-    let buf='';
-    while(true){
-      const{done,value}=await reader.read();
-      if(done)break;
-      buf+=dec.decode(value,{stream:true});
-      const lines=buf.split('\\n');buf=lines.pop()||'';
-      for(const line of lines){
-        if(!line.startsWith('data: '))continue;
-        const j=line.slice(6);if(j==='[DONE]')continue;
-        try{
-          const e=JSON.parse(j);
-          if(e.type==='text'){full+=e.content;aDiv.innerHTML=fmt(full);scroll()}
-          else if(e.type==='tool'){addEl('tool','&#9654; '+esc(e.name)+'('+esc(e.summary||'')+')')}
-          else if(e.type==='tool_error'){addEl('tool err','&#10007; '+esc(e.name)+': '+esc(e.error))}
-          else if(e.type==='error'){aDiv.innerHTML='<span style="color:#f85149">'+esc(e.content)+'</span>'}
-        }catch{}
-      }
-    }
-    if(!full&&aDiv.querySelector('.thinking'))aDiv.innerHTML='<span style="color:#8b949e">[empty]</span>';
-  }catch(e){aDiv.innerHTML='<span style="color:#f85149">Error: '+esc(e.message)+'</span>'}
-  sending=false;sendBtn.disabled=false;msgEl.focus();
-}
-fetch('/api/status').then(r=>r.json()).then(d=>{document.getElementById('model').textContent=d.model}).catch(()=>{});
-</script>
-</body></html>`;
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
 
-async function handleWebChat(req, res) {
-  let body = "";
-  for await (const chunk of req) body += chunk;
-
-  let message;
-  try { message = JSON.parse(body).message; } catch {
-    res.writeHead(400); res.end("Bad request"); return;
-  }
-  if (!message?.trim()) { res.writeHead(400); res.end("Empty"); return; }
-
-  if (webProcessing) {
-    res.writeHead(429, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Already processing" }));
-    return;
-  }
-  webProcessing = true;
-
-  res.writeHead(200, {
-    "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
-    "Connection": "keep-alive",
-  });
-
-  _sseRes = res;
-
-  try {
-    // Truncate oversized input
-    if (message.length > MAX_USER_MSG_BYTES) {
-      message = message.substring(0, MAX_USER_MSG_BYTES) + "\n\n...[truncated]";
-      sseWrite(res, { type: "status", content: "Input truncated" });
+    function cleanup() {
+      process.stdin.removeListener("data", onData);
+      process.stdin.setRawMode(false);
+      process.stdin.pause();
     }
 
-    history.push({ role: "user", parts: [{ text: message }] });
-    turnCount++;
+    function onData(data) {
+      for (let i = 0; i < data.length; i++) {
+        const byte = data[i];
 
-    let loops = 0;
-    while (loops < MAX_TOOL_LOOPS) {
-      loops++;
-
-      let response;
-      try {
-        response = await callGemini(history);
-      } catch (e) {
-        sseWrite(res, { type: "error", content: e.message });
-        break;
-      }
-
-      history.push(response);
-
-      const parts = response.parts || [];
-      const calls = parts.filter((p) => p.functionCall);
-
-      // Send text via SSE (all modes are non-streaming now)
-      const textParts = parts.filter((p) => p.text && !p.thought);
-      if (textParts.length > 0) {
-        sseWrite(res, { type: "text", content: textParts.map((p) => p.text).join("") });
-      }
-
-      if (calls.length === 0) break;
-
-      // Execute tools
-      const responses = [];
-      for (const part of calls) {
-        const { name, args } = part.functionCall;
-        const summary = fmtArgs(args);
-        sseWrite(res, { type: "tool", name, summary });
-
-        const result = TOOL_MAP[name] ? TOOL_MAP[name](args || {}) : { error: `Unknown tool: ${name}` };
-        if (result.success === false) {
-          sseWrite(res, { type: "tool_error", name, error: result.error || "failed" });
+        // Ctrl+C - exit
+        if (byte === 3) {
+          cleanup();
+          console.log("\n\x1b[90mBye.\x1b[0m");
+          process.exit(0);
         }
-        responses.push({ functionResponse: { name, response: result } });
+
+        // Ctrl+D - send
+        if (byte === 4) {
+          cleanup();
+          process.stdout.write("\n");
+          resolve(lines.join("\n"));
+          return;
+        }
+
+        // Enter - newline
+        if (byte === 13) {
+          lines.push("");
+          process.stdout.write("\n\x1b[90m│\x1b[0m ");
+          continue;
+        }
+
+        // Backspace
+        if (byte === 127 || byte === 8) {
+          if (lines[lines.length - 1].length > 0) {
+            lines[lines.length - 1] = lines[lines.length - 1].slice(0, -1);
+            process.stdout.write("\b \b");
+          } else if (lines.length > 1) {
+            lines.pop();
+            process.stdout.write("\x1b[A\r\x1b[K\x1b[90m│\x1b[0m " + lines[lines.length - 1]);
+          }
+          continue;
+        }
+
+        // Escape sequences (arrow keys etc) - skip
+        if (byte === 27) {
+          if (i + 1 < data.length && data[i + 1] === 91) {
+            i += 2;
+            while (i < data.length && data[i] < 64) i++;
+          }
+          continue;
+        }
+
+        // Regular UTF-8 character
+        let charBytes = 1;
+        if (byte >= 0xc0 && byte < 0xe0) charBytes = 2;
+        else if (byte >= 0xe0 && byte < 0xf0) charBytes = 3;
+        else if (byte >= 0xf0) charBytes = 4;
+        else if (byte < 0x20) continue; // skip other control chars
+
+        const char = data.slice(i, i + charBytes).toString("utf-8");
+        i += charBytes - 1;
+        lines[lines.length - 1] += char;
+        process.stdout.write(char);
       }
-
-      history.push({ role: "user", parts: responses });
     }
 
-    compactHistory();
-  } catch (e) {
-    sseWrite(res, { type: "error", content: e.message });
-  } finally {
-    _sseRes = null;
-    webProcessing = false;
-  }
-
-  sseWrite(res, { type: "done" });
-  res.end();
-}
-
-function startWebServer() {
-  const server = createServer(async (req, res) => {
-    if (req.method === "GET" && (req.url === "/" || req.url === "/index.html")) {
-      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-      res.end(WEB_HTML);
-      return;
-    }
-
-    if (req.method === "GET" && req.url === "/api/status") {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ model: MODEL, cwd: CWD, auth: isOAuthEnabled() ? "oauth" : API_KEY ? "api_key" : "none" }));
-      return;
-    }
-
-    if (req.method === "POST" && req.url === "/api/clear") {
-      history = []; turnCount = 0;
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: true }));
-      return;
-    }
-
-    if (req.method === "POST" && req.url === "/api/chat") {
-      await handleWebChat(req, res);
-      return;
-    }
-
-    res.writeHead(404); res.end("Not found");
-  });
-
-  server.listen(WEB_PORT, () => {
-    console.log(`\x1b[36mCoding Agent v0.2 (Web)\x1b[0m`);
-    console.log(`\x1b[90mModel: ${MODEL} | Dir: ${CWD}\x1b[0m`);
-    if (isOAuthEnabled()) console.log(`\x1b[32mOAuth: ${authTokens.email || "authenticated"}\x1b[0m`);
-    console.log(`\x1b[32m\nWeb UI: http://localhost:${WEB_PORT}\x1b[0m`);
-    console.log(`\x1b[90mCtrl+C で終了\x1b[0m\n`);
-    try { execSync(`termux-open-url "http://localhost:${WEB_PORT}"`, { stdio: "ignore", timeout: 3000 }); } catch {}
+    process.stdin.on("data", onData);
   });
 }
 
 // ====== Main ======
 async function main() {
-  if (process.argv.includes("--web")) {
-    startWebServer();
-    return;
-  }
-
-  console.log(`\x1b[36mCoding Agent v0.2\x1b[0m`);
+  console.log(`\x1b[36mCoding Agent v0.3\x1b[0m`);
   console.log(`\x1b[90mModel: ${MODEL} | Dir: ${CWD}\x1b[0m`);
 
   if (isOAuthEnabled()) {
@@ -1361,81 +1197,41 @@ async function main() {
     console.log(`\x1b[31m認証なし. /login でGoogleアカウント認証してください\x1b[0m`);
   }
 
-  console.log(`\x1b[90m/help でコマンド一覧\x1b[0m\n`);
+  console.log(`\x1b[90mEnter=改行 Ctrl+D=送信 /help=コマンド一覧\x1b[0m\n`);
 
-  const rl = createInterface({
-    input: process.stdin,
-    output: process.stdout,
-    prompt: "\x1b[32m> \x1b[0m",
-  });
-
-  let processing = false;
-
-  rl.prompt();
-
-  rl.on("line", async (line) => {
-    if (processing) return;
-
-    // Paste mode
-    if (pasteMode) {
-      if (line.trim() === "/end") {
-        pasteMode = false;
-        const input = pasteBuffer.join("\n");
-        pasteBuffer = [];
-        if (!input.trim()) { rl.prompt(); return; }
-        processing = true;
-        try {
-          const res = await agentTurn(input);
-          if (res) console.log(`\n${res}\n`);
-          compactHistory();
-        } catch (e) {
-          console.error(`\x1b[31mError: ${e.message}\x1b[0m\n`);
-        }
-        processing = false;
-        rl.prompt();
-      } else {
-        pasteBuffer.push(line);
-      }
-      return;
-    }
-
-    const input = line.trim();
-    if (!input) { rl.prompt(); return; }
+  while (true) {
+    const input = (await readUserInput()).trim();
+    if (!input) continue;
 
     // Commands
     if (input === "/login") {
-      processing = true;
       try { await startOAuthLogin(); } catch (e) {
         console.error(`\x1b[31mLogin failed: ${e.message}\x1b[0m\n`);
       }
-      processing = false;
-      rl.prompt();
-      return;
+      continue;
     }
     if (input === "/logout") {
       authTokens = null;
       try { writeFileSync(AUTH_FILE, "{}", "utf-8"); } catch {}
       console.log("\x1b[90mLogged out.\x1b[0m");
-      rl.prompt(); return;
+      continue;
     }
-    if (input === "/status") { showStatus(); rl.prompt(); return; }
-    if (input === "/clear") { history = []; turnCount = 0; console.log("\x1b[90mCleared.\x1b[0m"); rl.prompt(); return; }
+    if (input === "/status") { showStatus(); continue; }
+    if (input === "/clear") { history = []; turnCount = 0; console.log("\x1b[90mCleared.\x1b[0m"); continue; }
     if (input === "/compact") {
       if (compactHistory()) console.log(`\x1b[90mCompacted. ${history.length} msgs.\x1b[0m`);
       else console.log(`\x1b[90mAlready small (${history.length} msgs).\x1b[0m`);
-      rl.prompt(); return;
+      continue;
     }
     if (input === "/history") {
       const tc = history.filter((m) => m.parts?.some((p) => p.functionCall)).length;
       console.log(`\x1b[90mMessages: ${history.length} | Tool calls: ${tc} | Turns: ${turnCount}\x1b[0m`);
-      rl.prompt(); return;
+      continue;
     }
-    if (input === "/paste") { pasteMode = true; pasteBuffer = []; console.log("\x1b[90mPaste mode. /end で送信。\x1b[0m"); return; }
-    if (input === "/model") { console.log(`\x1b[90m${MODEL}\x1b[0m`); rl.prompt(); return; }
-    if (input === "/help") { showHelp(); rl.prompt(); return; }
+    if (input === "/model") { console.log(`\x1b[90m${MODEL}\x1b[0m`); continue; }
+    if (input === "/help") { showHelp(); continue; }
 
     // Agent turn
-    processing = true;
     try {
       const res = await agentTurn(input);
       if (res) console.log(`\n${res}\n`);
@@ -1444,15 +1240,7 @@ async function main() {
     } catch (e) {
       console.error(`\x1b[31mError: ${e.message}\x1b[0m\n`);
     }
-    processing = false;
-    rl.prompt();
-  });
-
-  rl.on("close", () => {
-    stopSpin();
-    console.log("\n\x1b[90mBye.\x1b[0m");
-    process.exit(0);
-  });
+  }
 }
 
 main();
