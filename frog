@@ -704,8 +704,8 @@ function stopSpin() {
 }
 
 // ====== Rate Limit ======
-// Code Assist (OAuth): ~1 RPM, Standard API (API Key): ~15 RPM
-const MIN_INTERVAL = API_KEY ? 5000 : 60000;
+// No preemptive cooldown - just handle 429 retries when they come
+const MIN_INTERVAL = 0;
 let lastApiCall = 0;
 
 function sleep(ms) {
@@ -822,7 +822,9 @@ async function callGeminiOAuthStream(contents, _retried) {
     if ((res.status === 401 || res.status === 403) && !_retried && (await refreshAccessToken())) {
       return callGeminiOAuthStream(contents, true);
     }
-    throw new Error(`CodeAssist API ${res.status}: ${errText.substring(0, 500)}`);
+    const err = new Error(`CodeAssist API ${res.status}: ${errText.substring(0, 500)}`);
+    if (res.status === 429) { err.status = 429; err.text = errText; }
+    throw err;
   }
 
   // Parse SSE stream
@@ -942,7 +944,9 @@ async function callGeminiOAuthNonStream(contents, _retried) {
     if ((res.status === 401 || res.status === 403) && !_retried && (await refreshAccessToken())) {
       return callGeminiOAuthNonStream(contents, true);
     }
-    throw new Error(`CodeAssist API ${res.status}: ${errText.substring(0, 500)}`);
+    const err = new Error(`CodeAssist API ${res.status}: ${errText.substring(0, 500)}`);
+    if (res.status === 429) { err.status = 429; err.text = errText; }
+    throw err;
   }
 
   const data = await res.json();
@@ -1014,6 +1018,7 @@ async function callGemini(contents, retries = 3) {
     compactHistory();
   }
   await rateLimitWait();
+  lastApiCall = Date.now(); // Set BEFORE request so streaming + tool exec counts toward cooldown
 
   try {
     let result;
@@ -1023,7 +1028,6 @@ async function callGemini(contents, retries = 3) {
     } else {
       result = await callGeminiApiKey(contents);
     }
-    lastApiCall = Date.now(); // Set AFTER response completes
     return result;
   } catch (e) {
     // Handle rate limit with retry
@@ -1443,19 +1447,36 @@ async function main() {
     if (input.startsWith("/model")) {
       const arg = input.split(/\s+/)[1];
       if (arg) {
+        // Direct match by name fragment
         const match = AVAILABLE_MODELS.find(m => m.includes(arg));
         if (match) {
           MODEL = match;
           console.log(`\x1b[90mModel: ${MODEL}\x1b[0m`);
         } else {
-          console.log(`\x1b[31mUnknown model. Available:\x1b[0m`);
-          AVAILABLE_MODELS.forEach((m, i) => console.log(`\x1b[90m  ${i + 1}. ${m}${m === MODEL ? " (current)" : ""}\x1b[0m`));
+          console.log(`\x1b[31mUnknown: ${arg}\x1b[0m`);
         }
       } else {
-        // Cycle through models
-        const idx = AVAILABLE_MODELS.indexOf(MODEL);
-        MODEL = AVAILABLE_MODELS[(idx + 1) % AVAILABLE_MODELS.length];
-        console.log(`\x1b[90mModel: ${MODEL}\x1b[0m`);
+        // Interactive selection
+        AVAILABLE_MODELS.forEach((m, i) => console.log(`\x1b[90m  ${i + 1}. ${m}${m === MODEL ? " \x1b[32m(current)\x1b[90m" : ""}\x1b[0m`));
+        const choice = await new Promise((res) => {
+          process.stdout.write(`\x1b[33m  番号: \x1b[0m`);
+          process.stdin.setRawMode(true);
+          process.stdin.resume();
+          process.stdin.once("data", (data) => {
+            process.stdin.setRawMode(false);
+            process.stdin.pause();
+            const ch = data.toString().trim();
+            process.stdout.write(ch + "\n");
+            res(ch);
+          });
+        });
+        const idx = parseInt(choice) - 1;
+        if (idx >= 0 && idx < AVAILABLE_MODELS.length) {
+          MODEL = AVAILABLE_MODELS[idx];
+          console.log(`\x1b[90mModel: ${MODEL}\x1b[0m`);
+        } else {
+          console.log(`\x1b[90m変更なし\x1b[0m`);
+        }
       }
       continue;
     }
