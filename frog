@@ -1022,7 +1022,6 @@ async function callGemini(contents, retries = 6, attempt = 0) {
     compactHistory();
   }
   await rateLimitWait();
-  lastApiCall = Date.now();
 
   try {
     let result;
@@ -1031,6 +1030,7 @@ async function callGemini(contents, retries = 6, attempt = 0) {
     } else {
       result = await callGeminiApiKey(contents);
     }
+    lastApiCall = Date.now(); // Set AFTER response so tool execution time counts toward cooldown
     return result;
   } catch (e) {
     // Handle rate limit with exponential backoff
@@ -1045,7 +1045,6 @@ async function callGemini(contents, retries = 6, attempt = 0) {
         process.stdout.write(`\x1b[33m  ! rate limit. waiting ${Math.ceil(waitSec)}s (attempt ${attempt + 1})...\x1b[0m\n`);
         startSpin(`retrying in ${Math.ceil(waitSec)}s...`);
         await sleep(waitSec * 1000);
-        lastApiCall = Date.now();
         return callGemini(contents, retries - 1, attempt + 1);
       }
       throw new Error(`Rate limit exceeded. しばらく待ってから再試行してください。`);
@@ -1058,7 +1057,6 @@ async function callGemini(contents, retries = 6, attempt = 0) {
       process.stdout.write(`\x1b[33m  ! network error: ${e.message}. retrying in ${Math.ceil(waitSec)}s...\x1b[0m\n`);
       startSpin(`retrying in ${Math.ceil(waitSec)}s...`);
       await sleep(waitSec * 1000);
-      lastApiCall = Date.now();
       return callGemini(contents, retries - 1, attempt + 1);
     }
 
