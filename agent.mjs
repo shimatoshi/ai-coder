@@ -278,6 +278,48 @@ function isOAuthEnabled() {
 let history = [];
 let turnCount = 0;
 
+// ====== Safety Mode ======
+// "off" = execute everything without asking
+// "confirm" = ask before every command
+// "blocklist" = ask only for dangerous commands
+let safetyMode = "blocklist";
+
+const DANGEROUS_PATTERNS = [
+  /\brm\s+(-[a-zA-Z]*[rf])/,
+  /\brm\s+--(?:recursive|force)/,
+  /\bmkfs\b/,
+  /\bdd\s+if=/,
+  />\s*\/dev\/sd/,
+  /\bgit\s+push\s+.*--force/,
+  /\bgit\s+reset\s+--hard/,
+  /\bgit\s+clean\s+-[a-zA-Z]*f/,
+  /\bchmod\s+(-R\s+)?777/,
+  /\bshutdown\b/,
+  /\breboot\b/,
+  /\bsudo\s+rm\b/,
+  /\bfmt\s+\/dev\//,
+];
+
+function isDangerous(command) {
+  return DANGEROUS_PATTERNS.some(p => p.test(command));
+}
+
+function confirmExecution(command) {
+  return new Promise((resolve) => {
+    process.stdout.write(`\x1b[33m  ! 確認: ${command}\x1b[0m\n`);
+    process.stdout.write(`\x1b[33m  実行する？ (y/n): \x1b[0m`);
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    process.stdin.once("data", (data) => {
+      process.stdin.setRawMode(false);
+      process.stdin.pause();
+      const ch = data.toString().toLowerCase();
+      process.stdout.write(ch === "y" ? "y\n" : "n\n");
+      resolve(ch === "y");
+    });
+  });
+}
+
 // ====== System Prompt ======
 const getSystemPrompt = () => `You are a coding agent running in a terminal on Android (Termux).
 You help developers by reading, writing, and editing code, running commands, and navigating projects.
@@ -497,7 +539,7 @@ function toolListDirectory({ path, recursive }) {
   }
 }
 
-function toolExecuteCommand({ command, timeout }) {
+async function toolExecuteCommand({ command, timeout }) {
   // Handle cd command - update CWD
   const cdMatch = command.match(/^cd\s+(.+)$/);
   if (cdMatch) {
@@ -507,6 +549,12 @@ function toolExecuteCommand({ command, timeout }) {
       return { success: true, output: `Changed directory to ${CWD}` };
     }
     return { success: false, error: `Directory not found: ${target}` };
+  }
+
+  // Safety check
+  if (safetyMode === "confirm" || (safetyMode === "blocklist" && isDangerous(command))) {
+    const ok = await confirmExecution(command);
+    if (!ok) return { success: false, error: "User denied execution" };
   }
 
   const ms = Math.min((timeout || 30) * 1000, 120000);
@@ -982,7 +1030,7 @@ async function agentTurn(userMessage) {
     for (const part of calls) {
       const { name, args } = part.functionCall;
       process.stdout.write(`\x1b[90m  > ${name}(${fmtArgs(args)})\x1b[0m\n`);
-      const result = TOOL_MAP[name] ? TOOL_MAP[name](args || {}) : { error: `Unknown tool: ${name}` };
+      const result = TOOL_MAP[name] ? await TOOL_MAP[name](args || {}) : { error: `Unknown tool: ${name}` };
       if (result.success === false) {
         process.stdout.write(`\x1b[31m    x ${result.error || "failed"}\x1b[0m\n`);
       }
@@ -1085,6 +1133,7 @@ Commands:
   /clear    会話履歴をクリア
   /compact  履歴を圧縮（トークン節約）
   /history  履歴の状態を表示
+  /safety   安全モード切替 (off/confirm/blocklist)
   /model    現在のモデルを表示
   /help     このヘルプを表示
   Ctrl+C    終了
@@ -1246,6 +1295,18 @@ async function main() {
       continue;
     }
     if (input === "/model") { console.log(`\x1b[90m${MODEL}\x1b[0m`); continue; }
+    if (input.startsWith("/safety")) {
+      const arg = input.split(/\s+/)[1];
+      if (arg && ["off", "confirm", "blocklist"].includes(arg)) {
+        safetyMode = arg;
+      } else {
+        // Cycle: blocklist → confirm → off → blocklist
+        safetyMode = safetyMode === "blocklist" ? "confirm" : safetyMode === "confirm" ? "off" : "blocklist";
+      }
+      const labels = { off: "\x1b[31mOFF (全許可)", confirm: "\x1b[33mCONFIRM (毎回確認)", blocklist: "\x1b[32mBLOCKLIST (危険コマンドのみ確認)" };
+      console.log(`\x1b[90mSafety: ${labels[safetyMode]}\x1b[0m`);
+      continue;
+    }
     if (input === "/help") { showHelp(); continue; }
 
     // Agent turn
