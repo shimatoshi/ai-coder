@@ -472,6 +472,18 @@ const tools = [
           required: ["pattern"],
         },
       },
+      {
+        name: "spawn_agent",
+        description:
+          "Spawn a sub-agent to perform a research/investigation task. The agent has its own context and can read files, search, and run commands. Use this for tasks that require exploring many files without polluting your main context. The agent returns a summary of its findings. Sub-agents CANNOT write or edit files.",
+        parameters: {
+          type: "OBJECT",
+          properties: {
+            task: { type: "STRING", description: "Clear description of what to investigate or research" },
+          },
+          required: ["task"],
+        },
+      },
     ],
   },
 ];
@@ -645,6 +657,134 @@ function toolSearchText({ pattern, path, file_pattern }) {
   }
 }
 
+// ====== Sub-Agent ======
+const SUB_AGENT_TOOLS = [
+  {
+    functionDeclarations: [
+      { name: "read_file", description: "Read file contents with line numbers.", parameters: { type: "OBJECT", properties: { path: { type: "STRING" } }, required: ["path"] } },
+      { name: "list_directory", description: "List files and directories.", parameters: { type: "OBJECT", properties: { path: { type: "STRING" }, recursive: { type: "BOOLEAN" } } } },
+      { name: "execute_command", description: "Run a read-only shell command (git, grep, cat, etc).", parameters: { type: "OBJECT", properties: { command: { type: "STRING" }, timeout: { type: "NUMBER" } }, required: ["command"] } },
+      { name: "find_files", description: "Find files by name pattern.", parameters: { type: "OBJECT", properties: { pattern: { type: "STRING" }, path: { type: "STRING" } }, required: ["pattern"] } },
+      { name: "search_text", description: "Search for text in files (grep).", parameters: { type: "OBJECT", properties: { pattern: { type: "STRING" }, path: { type: "STRING" }, file_pattern: { type: "STRING" } }, required: ["pattern"] } },
+    ],
+  },
+];
+
+const SUB_AGENT_TOOL_MAP = {
+  read_file: toolReadFile,
+  list_directory: toolListDirectory,
+  execute_command: toolExecuteCommand,
+  find_files: toolFindFiles,
+  search_text: toolSearchText,
+};
+
+const SUB_AGENT_MAX_LOOPS = 15;
+
+async function toolSpawnAgent({ task }) {
+  process.stdout.write(`\x1b[36m    🔍 sub-agent: ${task.substring(0, 80)}\x1b[0m\n`);
+
+  const subSystemPrompt = `You are a research sub-agent. Your job is to investigate and report findings.
+Current working directory: ${CWD}
+
+Rules:
+- You can ONLY read files, search, list directories, and run read-only commands.
+- You CANNOT write, edit, or create files.
+- Be efficient. Use search_text to find what you need, not list_directory browsing.
+- When done, provide a concise summary of your findings.
+- Use absolute paths.`;
+
+  const subHistory = [{ role: "user", parts: [{ text: task }] }];
+  let loops = 0;
+
+  while (loops < SUB_AGENT_MAX_LOOPS) {
+    if (aborted) return { success: false, error: "Aborted by user" };
+    loops++;
+
+    let response;
+    try {
+      const valid = await ensureValidToken();
+      if (!valid) return { success: false, error: "OAuth token invalid" };
+      await initProject();
+
+      const body = {
+        project: authTokens.project_id || "",
+        model: MODEL,
+        user_prompt_id: randomBytes(16).toString("hex"),
+        request: {
+          contents: subHistory,
+          tools: SUB_AGENT_TOOLS,
+          systemInstruction: { parts: [{ text: subSystemPrompt }] },
+          generationConfig: { temperature: 0.2 },
+          session_id: SESSION_ID,
+        },
+      };
+
+      await rateLimitWait();
+      const res = await fetchWithTimeout(
+        `${CODE_ASSIST_ENDPOINT}/v1internal:generateContent`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${authTokens.access_token}`,
+            ...getCodeAssistHeaders(),
+          },
+          body: JSON.stringify(body),
+        },
+        90000
+      );
+
+      if (!res.ok) {
+        const errText = await res.text();
+        if (res.status === 429) {
+          const serverDelay = parseRetryDelay(errText);
+          const waitMs = serverDelay > 0 ? serverDelay * 1000 : 5000;
+          process.stdout.write(`\x1b[90m    sub-agent 429, waiting ${Math.ceil(waitMs / 1000)}s...\x1b[0m\n`);
+          await sleep(waitMs);
+          continue;
+        }
+        return { success: false, error: `API ${res.status}: ${errText.substring(0, 200)}` };
+      }
+
+      const data = await res.json();
+      response = data.candidates?.[0]?.content;
+      if (!response) return { success: false, error: "Empty response from sub-agent" };
+      lastApiCall = Date.now();
+    } catch (e) {
+      return { success: false, error: `Sub-agent error: ${e.message}` };
+    }
+
+    subHistory.push(response);
+    const parts = response.parts || [];
+    const calls = parts.filter((p) => p.functionCall);
+
+    // No more tool calls - return the text response
+    if (calls.length === 0) {
+      const text = parts.filter((p) => p.text).map((p) => p.text).join("");
+      process.stdout.write(`\x1b[36m    🔍 sub-agent done (${loops} loops)\x1b[0m\n`);
+      return { success: true, result: text || "[No findings]" };
+    }
+
+    // Execute sub-agent tool calls
+    const responses = [];
+    for (const part of calls) {
+      if (aborted) break;
+      const { name, args } = part.functionCall;
+      process.stdout.write(`\x1b[90m    · ${name}(${fmtArgs(args)})\x1b[0m\n`);
+
+      const result = SUB_AGENT_TOOL_MAP[name]
+        ? await SUB_AGENT_TOOL_MAP[name](args || {})
+        : { error: `Unknown tool: ${name}` };
+
+      responses.push({ functionResponse: { name, response: result } });
+    }
+
+    subHistory.push({ role: "user", parts: responses });
+  }
+
+  return { success: true, result: "[Sub-agent reached loop limit. Partial results may be in context.]" };
+}
+
 const TOOL_MAP = {
   read_file: toolReadFile,
   write_file: toolWriteFile,
@@ -654,6 +794,7 @@ const TOOL_MAP = {
   execute_command: toolExecuteCommand,
   find_files: toolFindFiles,
   search_text: toolSearchText,
+  spawn_agent: toolSpawnAgent,
 };
 
 // ====== Hooks System (japanese-developer compatible) ======
