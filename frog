@@ -29,8 +29,10 @@ try {
 } catch {}
 
 // ====== OAuth Config (from Gemini CLI open source) ======
-const OAUTH_CLIENT_ID = process.env.OAUTH_CLIENT_ID || "";
-const OAUTH_CLIENT_SECRET = process.env.OAUTH_CLIENT_SECRET || "";
+// Default: Gemini CLI open-source OAuth credentials (Apache 2.0)
+// https://github.com/google-gemini/gemini-cli/blob/main/packages/core/src/code_assist/oauth2.ts
+const OAUTH_CLIENT_ID = process.env.OAUTH_CLIENT_ID || "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com";
+const OAUTH_CLIENT_SECRET = process.env.OAUTH_CLIENT_SECRET || "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";
 const OAUTH_REDIRECT_URI = "http://localhost:8085/oauth2callback";
 const OAUTH_SCOPES = [
   "https://www.googleapis.com/auth/cloud-platform",
