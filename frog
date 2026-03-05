@@ -14,7 +14,7 @@ import {
 import { execSync, spawnSync, spawn } from "node:child_process";
 import { resolve, dirname, join } from "node:path";
 import { homedir } from "node:os";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 
 // ====== Load .env (zero-dep) ======
@@ -38,15 +38,11 @@ const OAUTH_SCOPES = [
   "https://www.googleapis.com/auth/userinfo.profile",
 ];
 const CODE_ASSIST_ENDPOINT = "https://cloudcode-pa.googleapis.com";
-const CODE_ASSIST_HEADERS = (() => {
-  const arch = process.arch === "arm64" ? "ARM64" : "AMD64";
-  const plat = process.platform === "darwin" ? `DARWIN_${arch}`
-    : process.platform === "win32" ? `WINDOWS_${arch}` : `LINUX_${arch}`;
+function getCodeAssistHeaders() {
   return {
-    "X-Goog-Api-Client": `gl-node/${process.versions.node} gccl-gemini-cli/1.0.0`,
-    "Client-Metadata": `ideType=GEMINI_CLI,platform=${plat},pluginType=GEMINI`,
+    "User-Agent": `GeminiCLI/0.31.0/${MODEL} (${process.platform}; ${process.arch})`,
   };
-})();
+}
 
 // ====== General Config ======
 const API_KEY = process.env.GEMINI_API_KEY || "";
@@ -59,6 +55,7 @@ const AVAILABLE_MODELS = [
 ];
 const STANDARD_API_URL = "https://generativelanguage.googleapis.com/v1beta";
 const MAX_TOOL_LOOPS = 15;
+const SESSION_ID = randomUUID();
 let CWD = process.cwd();
 
 // ====== Auth Storage ======
@@ -823,7 +820,7 @@ async function initProject() {
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${authTokens.access_token}`,
-        ...CODE_ASSIST_HEADERS,
+        ...getCodeAssistHeaders(),
       },
       body: "{}",
     },
@@ -855,6 +852,7 @@ async function callGeminiOAuthStream(contents, _retried) {
       tools,
       systemInstruction: { parts: [{ text: getSystemPrompt() }] },
       generationConfig: { temperature: 0.2 },
+      session_id: SESSION_ID,
     },
   };
 
@@ -866,7 +864,7 @@ async function callGeminiOAuthStream(contents, _retried) {
         "Content-Type": "application/json",
         Authorization: `Bearer ${authTokens.access_token}`,
         Accept: "text/event-stream",
-        ...CODE_ASSIST_HEADERS,
+        ...getCodeAssistHeaders(),
       },
       body: JSON.stringify(body),
     },
@@ -978,6 +976,7 @@ async function callGeminiOAuthNonStream(contents, _retried) {
       tools,
       systemInstruction: { parts: [{ text: getSystemPrompt() }] },
       generationConfig: { temperature: 0.2 },
+      session_id: SESSION_ID,
     },
   };
 
@@ -988,7 +987,7 @@ async function callGeminiOAuthNonStream(contents, _retried) {
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${authTokens.access_token}`,
-        ...CODE_ASSIST_HEADERS,
+        ...getCodeAssistHeaders(),
       },
       body: JSON.stringify(body),
     },
@@ -1075,11 +1074,9 @@ async function callGemini(contents) {
   }
   await rateLimitWait();
 
-  const MAX_ATTEMPTS = 10;
+  const MAX_ATTEMPTS = 7;
   const INITIAL_DELAY = 5000;  // 5s (matches Gemini CLI)
   const MAX_DELAY = 30000;     // 30s cap (matches Gemini CLI)
-  const QUICK_RETRIES = 3;     // Layer 1: fast retries at 150ms
-  const QUICK_DELAY = 150;
 
   let currentDelay = INITIAL_DELAY;
   let savedModel = MODEL; // For fallback recovery
@@ -1122,13 +1119,7 @@ async function callGemini(contents) {
           throw new Error(`Rate limit exceeded. しばらく待ってから再試行してください。`);
         }
 
-        // Layer 1: Quick retries for transient 429s (like google-auth-library transport)
-        if (attempt < QUICK_RETRIES) {
-          await sleep(QUICK_DELAY);
-          continue;
-        }
-
-        // Layer 2: Exponential backoff with server delay respect
+        // Exponential backoff with server delay respect
         const serverDelay = parseRetryDelay(errText);
         let waitMs;
         if (serverDelay > 0) {
@@ -1142,6 +1133,7 @@ async function callGemini(contents) {
         }
 
         stopSpin();
+        if (attempt === 0) process.stdout.write(`\x1b[90m  429: ${errText.substring(0, 200)}\x1b[0m\n`);
         process.stdout.write(`\x1b[33m  ! rate limit. waiting ${Math.ceil(waitMs / 1000)}s (attempt ${attempt + 1}/${MAX_ATTEMPTS})...\x1b[0m\n`);
         startSpin(`retrying in ${Math.ceil(waitMs / 1000)}s...`);
         await sleep(waitMs);
