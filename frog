@@ -904,6 +904,27 @@ function setupSigintHandler() {
   });
 }
 
+// ====== Terminal Title ======
+function setTitle(text) {
+  process.stdout.write(`\x1b]0;${text}\x07`);
+}
+
+function titleIdle() {
+  setTitle(`🐸 frog [${MODEL}] ${CWD}`);
+}
+
+function titleThinking() {
+  setTitle(`🐸 frog ⟳ thinking...`);
+}
+
+function titleToolCall(name) {
+  setTitle(`🐸 frog ⚡ ${name}`);
+}
+
+function titleDone() {
+  setTitle(`🐸 frog ✓ done`);
+}
+
 // ====== Spinner ======
 const SPIN = ["\u28CB", "\u28D9", "\u28F9", "\u28F8", "\u28FC", "\u28F4", "\u28E6", "\u28E7", "\u28C7", "\u28CF"];
 let spinTimer = null;
@@ -1478,6 +1499,7 @@ async function agentTurn(userMessage) {
       return "";
     }
     loops++;
+    titleThinking();
     startSpin(loops === 1 ? "thinking..." : "continuing...");
 
     let response;
@@ -1506,6 +1528,7 @@ async function agentTurn(userMessage) {
       if (aborted) break;
       const { name, args } = part.functionCall;
       process.stdout.write(`\x1b[90m  > ${name}(${fmtArgs(args)})\x1b[0m\n`);
+      titleToolCall(name);
 
       // Loop detection: check for repeated identical calls
       const callKey = JSON.stringify({ name, args });
@@ -1970,6 +1993,7 @@ async function main() {
   }
 
   console.log(`\x1b[90mEnter=改行 Enter×2=送信 /help=コマンド一覧\x1b[0m\n`);
+  titleIdle();
 
   // Run SessionStart hooks (jdev: enforce-japanese, primer, etc.)
   await runSessionStartHooks();
@@ -2060,7 +2084,9 @@ async function main() {
     try {
       agentRunning = true;
       aborted = false;
+      titleThinking();
       const res = await agentTurn(input);
+      titleDone();
       if (res) console.log(`\n${res}\n`);
       else console.log("");
       compactHistory();
@@ -2069,6 +2095,8 @@ async function main() {
     } finally {
       agentRunning = false;
       aborted = false;
+      // Revert to idle after a moment so "done" is visible
+      setTimeout(titleIdle, 2000);
     }
   }
 }
