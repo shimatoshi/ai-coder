@@ -1727,6 +1727,7 @@ function readUserInput() {
     const lines = [""];
     let cursorPos = 0; // Character position within current line
     let partialBytes = null;
+    let lastCtrlC = 0;
 
     process.stdin.setRawMode(true);
     process.stdin.resume();
@@ -1768,8 +1769,17 @@ function readUserInput() {
       for (let i = 0; i < data.length; i++) {
         const byte = data[i];
 
-        // Ctrl+C - handled by SIGINT handler
+        // Ctrl+C - double tap to exit (raw mode doesn't emit SIGINT)
         if (byte === 3) {
+          const now = Date.now();
+          if (now - lastCtrlC < 500) {
+            cleanup();
+            console.log("\n\x1b[90mBye.\x1b[0m");
+            process.exit(0);
+          }
+          lastCtrlC = now;
+          process.stdout.write(`\n\x1b[90m(Ctrl+C again to exit)\x1b[0m\n`);
+          process.stdout.write(getPrefix());
           continue;
         }
 
