@@ -54,7 +54,7 @@ const AVAILABLE_MODELS = [
   "gemini-3.1-pro-preview",
 ];
 const STANDARD_API_URL = "https://generativelanguage.googleapis.com/v1beta";
-const MAX_TOOL_LOOPS = 15;
+const MAX_TOOL_LOOPS = 30;
 const SESSION_ID = randomUUID();
 let CWD = process.cwd();
 
@@ -330,35 +330,31 @@ function confirmAction(message) {
 
 // ====== System Prompt ======
 const getSystemPrompt = () => `You are a coding agent running in a terminal.
-You help developers by reading, writing, and editing code, running commands, and navigating projects.
-
 Current working directory: ${CWD}
 
-You can execute any shell command available on this system via execute_command.
-This includes git, gh (GitHub CLI), npm, node, python, curl, and any other installed tools.
-Use these proactively when they help accomplish the user's request.
+# Context Efficiency (CRITICAL)
+You have limited tool calls per turn. Minimize unnecessary calls.
 
-CRITICAL - Minimize API calls (rate limit is ~1 per minute):
-- Use ABSOLUTE PATHS for all file operations (based on current working directory shown above)
-- Do NOT use cd commands. Use absolute paths instead.
-- ALWAYS use write_files (plural) to create multiple files in ONE tool call. NEVER call write_file multiple times in a row.
-- Do NOT read a file right after writing it just to verify - trust the write succeeded
-- Plan your work first, then execute ALL file writes in a single write_files call
-- When creating a project, put ALL files in one write_files call
-- Combine as much work as possible into each tool call to minimize round-trips
+Strategy:
+1. Use search_text (grep) to find what you need. Do NOT list directories to browse.
+2. Read only the files you actually need to modify.
+3. Plan ALL changes first, then execute writes in as few calls as possible.
+4. Use write_files (plural) to create multiple files in ONE call.
+5. Use absolute paths. Do NOT use cd commands.
+6. Do NOT read a file after writing to verify. Trust the write.
+7. Combine shell commands with && when possible.
+
+Workflow: Research → Strategy → Execution
+- Research: Use search_text and read_file to understand the codebase. Be targeted.
+- Strategy: Plan your changes before acting. Do not start writing code until you know what to change.
+- Execution: Apply changes surgically. Validate with tests/builds if applicable.
 
 Rules:
-- Use edit_file for modifications to existing files, write_file for new files
-- Be concise. Show what you did, not lengthy explanations
-- When you encounter errors, fix them and retry
+- Use edit_file for modifications, write_file/write_files for new files
+- Be concise. Under 3 lines of text output unless explaining complex changes.
 - Respond in the same language the user uses
-- NEVER run interactive commands. Always use non-interactive flags:
-  - npm create vite → npm create vite@latest myapp -- --template react-ts
-  - npm init → npm init -y
-  - npx create-react-app → npx create-react-app myapp --template typescript
-  - pip install → pip install -y / --yes where applicable
-  - git commit → always use -m flag
-  - Any command that prompts: add --yes, -y, or pipe input to avoid hangs`;
+- NEVER run interactive commands. Use non-interactive flags (-y, --yes, -m, etc.)
+- Do NOT explore aimlessly. If you cannot find something in 2-3 searches, ask the user.`;
 
 // ====== Tool Definitions ======
 const tools = [
@@ -549,10 +545,20 @@ function toolListDirectory({ path, recursive }) {
   try {
     const full = resolvePath(path);
     if (recursive) {
-      const r = spawnSync("find", [full, "-maxdepth", "3", "-not", "-path", "*/node_modules/*", "-not", "-path", "*/.git/*", "-not", "-path", "*/__pycache__/*"], { encoding: "utf-8", timeout: 10000 });
-      return { success: true, path: full, entries: (r.stdout || "").trim().split("\n").filter(Boolean).slice(0, 300) };
+      const r = spawnSync("find", [full, "-maxdepth", "3", "-not", "-path", "*/node_modules/*", "-not", "-path", "*/.git/*", "-not", "-path", "*/__pycache__/*", "-not", "-path", "*/dist/*", "-not", "-path", "*/.next/*"], { encoding: "utf-8", timeout: 10000 });
+      const all = (r.stdout || "").trim().split("\n").filter(Boolean);
+      const entries = all.slice(0, 150);
+      const result = { success: true, path: full, entries, total: all.length };
+      if (all.length > 150) result.note = `Showing 150 of ${all.length} entries. Use search_text or find_files to narrow down.`;
+      return result;
     }
-    const entries = readdirSync(full, { withFileTypes: true }).map((e) => ({ name: e.name, type: e.isDirectory() ? "dir" : "file" }));
+    const raw = readdirSync(full, { withFileTypes: true });
+    const entries = raw.map((e) => ({ name: e.name, type: e.isDirectory() ? "dir" : "file" }));
+    if (entries.length > 80) {
+      const dirs = entries.filter((e) => e.type === "dir");
+      const files = entries.filter((e) => e.type === "file").slice(0, 80 - dirs.length);
+      return { success: true, path: full, entries: [...dirs, ...files], total: entries.length, note: `Showing ${dirs.length} dirs + ${files.length} files of ${entries.length} total. Use find_files or search_text to narrow down.` };
+    }
     return { success: true, path: full, entries };
   } catch (e) {
     return { success: false, error: e.message };
@@ -617,12 +623,23 @@ function toolFindFiles({ pattern, path }) {
 function toolSearchText({ pattern, path, file_pattern }) {
   try {
     const full = resolvePath(path);
-    const args = ["-rn", "--color=never", "-I"];
+    const args = ["-rn", "--color=never", "-I", "-l"];
     if (file_pattern) args.push("--include=" + file_pattern);
-    args.push("--exclude-dir=node_modules", "--exclude-dir=.git", pattern, full);
-    const r = spawnSync("grep", args, { encoding: "utf-8", timeout: 15000 });
-    const lines = (r.stdout || "").trim().split("\n").filter(Boolean).slice(0, 80);
-    return { success: true, matches: lines, count: lines.length };
+    args.push("--exclude-dir=node_modules", "--exclude-dir=.git", "--exclude-dir=dist", "--exclude-dir=.next", pattern, full);
+    // First get matching files
+    const fileResult = spawnSync("grep", args, { encoding: "utf-8", timeout: 15000 });
+    const matchingFiles = (fileResult.stdout || "").trim().split("\n").filter(Boolean);
+
+    // Then get line matches (limited)
+    const lineArgs = ["-rn", "--color=never", "-I"];
+    if (file_pattern) lineArgs.push("--include=" + file_pattern);
+    lineArgs.push("--exclude-dir=node_modules", "--exclude-dir=.git", "--exclude-dir=dist", "--exclude-dir=.next", pattern, full);
+    const r = spawnSync("grep", lineArgs, { encoding: "utf-8", timeout: 15000 });
+    const allLines = (r.stdout || "").trim().split("\n").filter(Boolean);
+    const lines = allLines.slice(0, 50);
+    const result = { success: true, matches: lines, count: lines.length, total_matches: allLines.length, files_matched: matchingFiles.length };
+    if (allLines.length > 50) result.note = `Showing 50 of ${allLines.length} matches across ${matchingFiles.length} files. Use file_pattern to narrow down.`;
+    return result;
   } catch (e) {
     return { success: false, error: e.message };
   }
@@ -684,6 +701,31 @@ async function runHooks(phase, toolName, input) {
 }
 
 loadHooks();
+
+// ====== Abort Control ======
+let aborted = false;
+let agentRunning = false;
+
+function setupSigintHandler() {
+  let lastSigint = 0;
+  process.on("SIGINT", () => {
+    if (agentRunning) {
+      // During agent turn: set abort flag
+      aborted = true;
+      stopSpin();
+      process.stdout.write(`\n\x1b[33m  ⏹ Interrupted. Finishing current step...\x1b[0m\n`);
+    } else {
+      // During input: double Ctrl+C to exit
+      const now = Date.now();
+      if (now - lastSigint < 500) {
+        console.log("\n\x1b[90mBye.\x1b[0m");
+        process.exit(0);
+      }
+      lastSigint = now;
+      process.stdout.write(`\n\x1b[90m(Ctrl+C again to exit)\x1b[0m\n`);
+    }
+  });
+}
 
 // ====== Spinner ======
 const SPIN = ["\u28CB", "\u28D9", "\u28F9", "\u28F8", "\u28FC", "\u28F4", "\u28E6", "\u28E7", "\u28C7", "\u28CF"];
@@ -1187,7 +1229,17 @@ async function agentTurn(userMessage) {
   turnCount++;
 
   let loops = 0;
+  const callLog = []; // Loop detection: track recent tool calls
+  let exploreCount = 0; // Count exploration-type calls
+  const EXPLORE_BUDGET = 12; // Max exploration calls per turn
+  const EXPLORE_TOOLS = new Set(["list_directory", "find_files", "search_text"]);
+
   while (loops < MAX_TOOL_LOOPS) {
+    if (aborted) {
+      aborted = false;
+      process.stdout.write(`\x1b[33m  ⏹ Turn aborted by user.\x1b[0m\n`);
+      return "";
+    }
     loops++;
     startSpin(loops === 1 ? "thinking..." : "continuing...");
 
@@ -1214,8 +1266,36 @@ async function agentTurn(userMessage) {
     // Execute tool calls
     const responses = [];
     for (const part of calls) {
+      if (aborted) break;
       const { name, args } = part.functionCall;
       process.stdout.write(`\x1b[90m  > ${name}(${fmtArgs(args)})\x1b[0m\n`);
+
+      // Loop detection: check for repeated identical calls
+      const callKey = JSON.stringify({ name, args });
+      const repeatCount = callLog.filter((k) => k === callKey).length;
+      callLog.push(callKey);
+
+      if (repeatCount >= 2) {
+        process.stdout.write(`\x1b[33m    ! loop detected: ${name} called ${repeatCount + 1} times with same args\x1b[0m\n`);
+        responses.push({ functionResponse: { name, response: {
+          success: false,
+          error: `This exact call (${name} with same arguments) has been made ${repeatCount + 1} times already. You are in a loop. Stop repeating and either try a different approach or respond with what you have so far.`,
+        } } });
+        continue;
+      }
+
+      // Exploration budget: block excessive exploration
+      if (EXPLORE_TOOLS.has(name)) {
+        exploreCount++;
+        if (exploreCount > EXPLORE_BUDGET) {
+          process.stdout.write(`\x1b[33m    ! explore budget exceeded (${exploreCount}/${EXPLORE_BUDGET}). Blocked.\x1b[0m\n`);
+          responses.push({ functionResponse: { name, response: {
+            success: false,
+            error: `Exploration budget exhausted (${EXPLORE_BUDGET} calls used). You MUST now work with the files you have already found. Do NOT call list_directory, find_files, or search_text again. Write code or respond to the user.`,
+          } } });
+          continue;
+        }
+      }
 
       // BeforeTool hooks
       const hookResult = await runHooks("BeforeTool", name, args || {});
@@ -1439,11 +1519,9 @@ function readUserInput() {
       for (let i = 0; i < data.length; i++) {
         const byte = data[i];
 
-        // Ctrl+C
+        // Ctrl+C - handled by SIGINT handler
         if (byte === 3) {
-          cleanup();
-          console.log("\n\x1b[90mBye.\x1b[0m");
-          process.exit(0);
+          continue;
         }
 
         // Ctrl+D - send
@@ -1699,14 +1777,20 @@ async function main() {
 
     // Agent turn
     try {
+      agentRunning = true;
+      aborted = false;
       const res = await agentTurn(input);
       if (res) console.log(`\n${res}\n`);
       else console.log("");
       compactHistory();
     } catch (e) {
       console.error(`\x1b[31mError: ${e.message}\x1b[0m\n`);
+    } finally {
+      agentRunning = false;
+      aborted = false;
     }
   }
 }
 
+setupSigintHandler();
 main();
