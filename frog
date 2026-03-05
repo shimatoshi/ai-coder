@@ -845,8 +845,20 @@ function isTerminalQuota(errText) {
   return false;
 }
 
+const MODEL_FALLBACK = {
+  "gemini-3.1-pro-preview": "gemini-3-flash-preview",
+  "gemini-3-flash-preview": "gemini-2.5-flash",
+  "gemini-2.5-pro": "gemini-2.5-flash",
+  "gemini-2.5-flash": null, // nowhere to fall
+};
+const FALLBACK_THRESHOLD_MS = 20000; // 20s: switch model instead of waiting
+
+function getModelFallback() {
+  return MODEL_FALLBACK[MODEL] || null;
+}
+
 function getFlashFallback() {
-  // Find a flash model different from current
+  // For terminal quota: find any flash model different from current
   const flash = AVAILABLE_MODELS.find(m => m.includes("flash") && m !== MODEL);
   return flash || null;
 }
@@ -1109,6 +1121,8 @@ function isRateLimitError(e) {
   return e?.status === 429 || (e?.message && e.message.includes("429"));
 }
 
+let pendingRestore = null; // Model to restore on next successful call
+
 async function callGemini(contents) {
   // Auto-compact if payload too large
   if (estimateSize(contents) > MAX_PAYLOAD_BYTES) {
@@ -1116,12 +1130,20 @@ async function callGemini(contents) {
   }
   await rateLimitWait();
 
+  // Try restoring original model if we fell back previously
+  if (pendingRestore && MODEL !== pendingRestore) {
+    const restoreFrom = MODEL;
+    MODEL = pendingRestore;
+    process.stdout.write(`\x1b[90m  (trying to restore: ${MODEL})\x1b[0m\n`);
+    pendingRestore = null;
+    // If restore fails with 429, we'll fall back again below
+  }
+
   const MAX_ATTEMPTS = 7;
   const INITIAL_DELAY = 5000;  // 5s (matches Gemini CLI)
   const MAX_DELAY = 30000;     // 30s cap (matches Gemini CLI)
 
   let currentDelay = INITIAL_DELAY;
-  let savedModel = MODEL; // For fallback recovery
 
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     try {
@@ -1132,11 +1154,6 @@ async function callGemini(contents) {
         result = await callGeminiApiKey(contents);
       }
       lastApiCall = Date.now();
-      // Restore model if we fell back
-      if (MODEL !== savedModel) {
-        process.stdout.write(`\x1b[90m  (restoring model: ${savedModel})\x1b[0m\n`);
-        MODEL = savedModel;
-      }
       return result;
     } catch (e) {
       if (isRateLimitError(e)) {
@@ -1148,7 +1165,7 @@ async function callGemini(contents) {
           if (flash && MODEL !== flash) {
             stopSpin();
             process.stdout.write(`\x1b[33m  ! daily quota reached on ${MODEL}. falling back to ${flash}\x1b[0m\n`);
-            savedModel = MODEL;
+            pendingRestore = MODEL;
             MODEL = flash;
             attempt = -1; // Reset attempts
             currentDelay = INITIAL_DELAY;
@@ -1165,17 +1182,29 @@ async function callGemini(contents) {
         const serverDelay = parseRetryDelay(errText);
         let waitMs;
         if (serverDelay > 0) {
-          // Server told us how long - trust it, add small jitter
           waitMs = serverDelay * 1000 + currentDelay * 0.2 * Math.random();
           currentDelay = Math.max(currentDelay, serverDelay * 1000);
         } else {
-          // No server hint - use exponential backoff with ±30% jitter
           const jitter = currentDelay * 0.3 * (Math.random() * 2 - 1);
           waitMs = Math.max(0, currentDelay + jitter);
         }
 
         stopSpin();
         if (attempt === 0) process.stdout.write(`\x1b[90m  429: ${errText.substring(0, 200)}\x1b[0m\n`);
+
+        // Auto-fallback: if wait > 20s, switch model instead of waiting
+        if (waitMs > FALLBACK_THRESHOLD_MS) {
+          const fallback = getModelFallback();
+          if (fallback) {
+            process.stdout.write(`\x1b[33m  ! wait ${Math.ceil(waitMs / 1000)}s > ${FALLBACK_THRESHOLD_MS / 1000}s threshold. switching ${MODEL} → ${fallback}\x1b[0m\n`);
+            pendingRestore = pendingRestore || MODEL; // remember original
+            MODEL = fallback;
+            attempt = -1;
+            currentDelay = INITIAL_DELAY;
+            continue;
+          }
+        }
+
         process.stdout.write(`\x1b[33m  ! rate limit. waiting ${Math.ceil(waitMs / 1000)}s (attempt ${attempt + 1}/${MAX_ATTEMPTS})...\x1b[0m\n`);
         startSpin(`retrying in ${Math.ceil(waitMs / 1000)}s...`);
         await sleep(waitMs);
