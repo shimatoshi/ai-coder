@@ -1688,6 +1688,12 @@ function showStatus() {
 }
 
 // ====== Character Width ======
+function displayWidth(str) {
+  let w = 0;
+  for (const ch of str) w += isWideChar(ch) ? 2 : 1;
+  return w;
+}
+
 function isWideChar(char) {
   if (!char) return false;
   const c = char.codePointAt(0);
@@ -1742,21 +1748,29 @@ function readUserInput() {
       return lines.length > 1 ? "\x1b[90m│\x1b[0m " : "\x1b[32m> \x1b[0m";
     }
 
+    let prevWrappedLines = 1; // track previous wrap count for proper cleanup
+
     function redrawLine() {
       const prefix = getPrefix();
       const text = lines[lines.length - 1];
       const cols = process.stdout.columns || 80;
       const prefixLen = prefix.replace(/\x1b\[[^m]*m/g, "").length;
-      const rendered = prefixLen + text.length;
+      const textWidth = displayWidth(text);
+      const rendered = prefixLen + textWidth;
       const wrappedLines = Math.ceil(rendered / cols) || 1;
-      if (wrappedLines > 1) {
-        process.stdout.write(`\x1b[${wrappedLines - 1}A`);
+      // Move up to the start of the previous rendering
+      const linesToClear = Math.max(wrappedLines, prevWrappedLines);
+      if (linesToClear > 1) {
+        process.stdout.write(`\x1b[${linesToClear - 1}A`);
       }
       process.stdout.write(`\r\x1b[J` + prefix + text);
+      prevWrappedLines = wrappedLines;
       // Move cursor back to correct position if not at end
-      const charsAfter = [...text].length - cursorPos;
-      if (charsAfter > 0) {
-        process.stdout.write(`\x1b[${charsAfter}D`);
+      const chars = [...text];
+      const afterCursor = chars.slice(cursorPos);
+      const afterWidth = afterCursor.reduce((w, ch) => w + (isWideChar(ch) ? 2 : 1), 0);
+      if (afterWidth > 0) {
+        process.stdout.write(`\x1b[${afterWidth}D`);
       }
     }
 
@@ -1825,6 +1839,7 @@ function readUserInput() {
           }
           lines.push("");
           cursorPos = 0;
+          prevWrappedLines = 1;
           process.stdout.write("\n\x1b[90m│\x1b[0m ");
           continue;
         }
@@ -1841,6 +1856,7 @@ function readUserInput() {
             lines.pop();
             const prevChars = [...lines[lines.length - 1]];
             cursorPos = prevChars.length;
+            prevWrappedLines = 1; // reset before redraw
             process.stdout.write("\x1b[2K\x1b[A");
             redrawLine();
           }
