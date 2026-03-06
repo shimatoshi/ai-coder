@@ -1473,6 +1473,20 @@ function fmtArgs(args) {
     .join(" ");
 }
 
+// ====== Abort Cleanup ======
+function cleanupHistoryAfterAbort() {
+  // Remove trailing model response that contains unanswered functionCalls.
+  // Gemini API returns 400 INVALID_ARGUMENT if a functionCall has no matching functionResponse.
+  while (history.length > 0) {
+    const last = history[history.length - 1];
+    if (last.role === "model" && last.parts?.some((p) => p.functionCall)) {
+      history.pop();
+    } else {
+      break;
+    }
+  }
+}
+
 // ====== Agent Turn ======
 const MAX_USER_MSG_BYTES = 50000; // 50KB max per user message
 
@@ -1497,6 +1511,8 @@ async function agentTurn(userMessage) {
   while (loops < MAX_TOOL_LOOPS) {
     if (aborted) {
       aborted = false;
+      // Clean up broken history: remove trailing model response with unanswered tool calls
+      cleanupHistoryAfterAbort();
       process.stdout.write(`\x1b[33m  ⏹ Turn aborted by user.\x1b[0m\n`);
       return "";
     }
@@ -1588,6 +1604,12 @@ async function agentTurn(userMessage) {
       }
 
       responses.push({ functionResponse: { name, response: result } });
+    }
+
+    // If aborted mid-tool-execution, remove the unanswered model response and don't push partial results
+    if (aborted && responses.length < calls.length) {
+      history.pop(); // remove model response with functionCalls that won't all be answered
+      continue; // will hit the abort check at top of loop
     }
 
     history.push({ role: "user", parts: responses });
