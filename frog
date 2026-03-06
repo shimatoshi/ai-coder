@@ -1063,9 +1063,12 @@ function getModelFallback() {
 }
 
 function getFlashFallback() {
-  // For terminal quota: find any flash model different from current
-  const flash = AVAILABLE_MODELS.find(m => m.includes("flash") && m !== MODEL);
-  return flash || null;
+  // For terminal quota: try next model in fallback chain (not just flash)
+  const chain = MODEL_FALLBACK_CHAIN[MODEL] || [];
+  for (const candidate of chain) {
+    if (!fallbackTried.has(candidate)) return candidate;
+  }
+  return null;
 }
 
 // ====== Gemini API ======
