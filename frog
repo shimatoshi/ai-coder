@@ -61,6 +61,7 @@ function frogLog(tool, detail) {
 // ====== General Config ======
 const API_KEY = process.env.GEMINI_API_KEY || "";
 const XAI_API_KEY = process.env.XAI_API_KEY || "";
+const MINIMAX_API_KEY = process.env.MINIMAX_API_KEY || "";
 let MODEL = process.env.AGENT_MODEL || "gemini-3-flash-preview";
 
 // ====== Provider Registry ======
@@ -75,6 +76,9 @@ const PROVIDER_MODELS = {
   "gemini-3.1-pro-preview": { provider: "gemini" },
   // xAI Grok models (OpenAI-compatible)
   "grok-code-fast-1":       { provider: "xai", apiBase: "https://api.x.ai/v1", apiKey: () => XAI_API_KEY },
+  // MiniMax models (OpenAI-compatible)
+  "MiniMax-M2.5-highspeed": { provider: "minimax", apiBase: "https://api.minimax.io/v1", apiKey: () => MINIMAX_API_KEY },
+  "MiniMax-M2.5":           { provider: "minimax", apiBase: "https://api.minimax.io/v1", apiKey: () => MINIMAX_API_KEY },
 };
 
 // Build AVAILABLE_MODELS dynamically: Gemini always, others if API key is set
@@ -83,6 +87,7 @@ function getAvailableModels() {
     const p = PROVIDER_MODELS[m];
     if (p.provider === "gemini") return true;
     if (p.provider === "xai") return !!XAI_API_KEY;
+    if (p.provider === "minimax") return !!MINIMAX_API_KEY;
     return false;
   });
   return models;
@@ -1123,12 +1128,13 @@ function isTerminalQuota(errText) {
 function buildFallbackChain() {
   const geminiChain = ["gemini-3.1-pro-preview", "gemini-3-pro-preview", "gemini-3-flash-preview", "gemini-2.5-pro"];
   const grokModels = XAI_API_KEY ? ["grok-code-fast-1"] : [];
+  const minimaxModels = MINIMAX_API_KEY ? ["MiniMax-M2.5-highspeed", "MiniMax-M2.5"] : [];
   const lastResort = ["gemini-2.5-flash"];
 
   const chain = {};
   for (const model of Object.keys(PROVIDER_MODELS)) {
     if (!AVAILABLE_MODELS.includes(model)) continue;
-    const full = [...geminiChain, ...grokModels, ...lastResort].filter(m => m !== model && AVAILABLE_MODELS.includes(m));
+    const full = [...geminiChain, ...grokModels, ...minimaxModels, ...lastResort].filter(m => m !== model && AVAILABLE_MODELS.includes(m));
     chain[model] = full;
   }
   return chain;
@@ -2034,6 +2040,10 @@ function showStatus() {
   if (XAI_API_KEY) {
     console.log(`\x1b[32mxAI Grok: Active\x1b[0m`);
     console.log(`\x1b[90mModels: ${Object.keys(PROVIDER_MODELS).filter(m => PROVIDER_MODELS[m].provider === "xai").join(", ")}\x1b[0m`);
+  }
+  if (MINIMAX_API_KEY) {
+    console.log(`\x1b[32mMiniMax: Active\x1b[0m`);
+    console.log(`\x1b[90mModels: ${Object.keys(PROVIDER_MODELS).filter(m => PROVIDER_MODELS[m].provider === "minimax").join(", ")}\x1b[0m`);
   }
   console.log(`\x1b[90mCurrent model: ${MODEL} (${getProvider(MODEL)})\x1b[0m`);
 }
