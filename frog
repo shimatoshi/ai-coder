@@ -59,7 +59,7 @@ function frogLog(tool, detail) {
 }
 
 // ====== General Config ======
-const API_KEY = process.env.GEMINI_API_KEY || "";
+let API_KEY = process.env.GEMINI_API_KEY || "";
 let MODEL = process.env.AGENT_MODEL || "gemini-3-flash-preview";
 
 const AVAILABLE_MODELS = [
@@ -103,6 +103,78 @@ function generatePKCE() {
 }
 
 // ====== OAuth Flow ======
+function readSimpleLine(prompt) {
+  return new Promise((resolve) => {
+    process.stdout.write(prompt);
+    let buf = "";
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    function onData(data) {
+      const ch = data.toString();
+      if (ch === "\r" || ch === "\n") {
+        process.stdin.removeListener("data", onData);
+        process.stdin.setRawMode(false);
+        process.stdin.pause();
+        process.stdout.write("\n");
+        resolve(buf);
+      } else if (ch === "\x03") { // Ctrl+C
+        process.stdin.removeListener("data", onData);
+        process.stdin.setRawMode(false);
+        process.stdin.pause();
+        process.stdout.write("\n");
+        resolve(null);
+      } else if (ch === "\x7f" || ch === "\b") { // Backspace
+        if (buf.length > 0) {
+          buf = buf.slice(0, -1);
+          process.stdout.write("\b \b");
+        }
+      } else if (ch >= " ") {
+        buf += ch;
+        process.stdout.write("*");
+      }
+    }
+    process.stdin.on("data", onData);
+  });
+}
+
+async function configureApiKey() {
+  console.log(`\x1b[36m\nGemini APIキー設定\x1b[0m`);
+  if (API_KEY) {
+    console.log(`\x1b[90m現在: ${API_KEY.substring(0, 8)}...(設定済み)\x1b[0m`);
+  } else {
+    console.log(`\x1b[90m現在: 未設定\x1b[0m`);
+  }
+  console.log(`\x1b[90mhttps://aistudio.google.com/apikey で取得できます\x1b[0m`);
+  console.log(`\x1b[90mCtrl+C でキャンセル\x1b[0m\n`);
+
+  const key = await readSimpleLine("\x1b[33mAPIキー: \x1b[0m");
+  if (key === null) {
+    console.log("\x1b[90mキャンセルしました\x1b[0m");
+    return;
+  }
+  const trimmed = key.trim();
+  if (!trimmed) {
+    console.log("\x1b[90m空のキーは無視されました\x1b[0m");
+    return;
+  }
+
+  // Save to .env
+  const envPath = join(dirname(new URL(import.meta.url).pathname), ".env");
+  let envContent = "";
+  try { envContent = readFileSync(envPath, "utf-8"); } catch {}
+
+  if (envContent.match(/^GEMINI_API_KEY=/m)) {
+    envContent = envContent.replace(/^GEMINI_API_KEY=.*/m, `GEMINI_API_KEY=${trimmed}`);
+  } else {
+    envContent += `${envContent && !envContent.endsWith("\n") ? "\n" : ""}GEMINI_API_KEY=${trimmed}\n`;
+  }
+  writeFileSync(envPath, envContent, "utf-8");
+
+  API_KEY = trimmed;
+  process.env.GEMINI_API_KEY = trimmed;
+  console.log(`\x1b[32m\nAPIキーを保存しました (.env)\x1b[0m\n`);
+}
+
 async function startOAuthLogin() {
   const { verifier, challenge } = generatePKCE();
   const state = randomBytes(16).toString("hex");
@@ -1762,6 +1834,7 @@ function showHelp() {
 
 Commands:
   /login    Googleアカウントで認証（1000回/日）
+  /api      Gemini APIキーを設定
   /logout   認証情報を削除
   /status   認証状態を表示
   /clear    会話履歴をクリア
@@ -2094,6 +2167,10 @@ async function main() {
       try { await startOAuthLogin(); } catch (e) {
         console.error(`\x1b[31mLogin failed: ${e.message}\x1b[0m\n`);
       }
+      continue;
+    }
+    if (input === "/api") {
+      await configureApiKey();
       continue;
     }
     if (input === "/logout") {
