@@ -2316,13 +2316,33 @@ async function main() {
     }
     if (input.startsWith("/safety")) {
       const arg = input.split(/\s+/)[1];
-      if (arg && ["off", "confirm", "blocklist"].includes(arg)) {
+      const SAFETY_MODES = ["blocklist", "confirm", "off"];
+      const labels = { off: "\x1b[31mOFF (全許可)", confirm: "\x1b[33mCONFIRM (毎回確認)", blocklist: "\x1b[32mBLOCKLIST (危険コマンドのみ確認)" };
+      if (arg && SAFETY_MODES.includes(arg)) {
         safetyMode = arg;
       } else {
-        // Cycle: blocklist → confirm → off → blocklist
-        safetyMode = safetyMode === "blocklist" ? "confirm" : safetyMode === "confirm" ? "off" : "blocklist";
+        // Interactive selection
+        SAFETY_MODES.forEach((m, i) => console.log(`\x1b[90m  ${i + 1}. ${labels[m]}${m === safetyMode ? " \x1b[90m(current)" : ""}\x1b[0m`));
+        const choice = await new Promise((res) => {
+          process.stdout.write(`\x1b[33m  番号: \x1b[0m`);
+          process.stdin.setRawMode(true);
+          process.stdin.resume();
+          process.stdin.once("data", (data) => {
+            process.stdin.setRawMode(false);
+            process.stdin.pause();
+            const ch = data.toString().trim();
+            process.stdout.write(ch + "\n");
+            res(ch);
+          });
+        });
+        const idx = parseInt(choice) - 1;
+        if (idx >= 0 && idx < SAFETY_MODES.length) {
+          safetyMode = SAFETY_MODES[idx];
+        } else {
+          console.log(`\x1b[90m変更なし\x1b[0m`);
+          continue;
+        }
       }
-      const labels = { off: "\x1b[31mOFF (全許可)", confirm: "\x1b[33mCONFIRM (毎回確認)", blocklist: "\x1b[32mBLOCKLIST (危険コマンドのみ確認)" };
       console.log(`\x1b[90mSafety: ${labels[safetyMode]}\x1b[0m`);
       continue;
     }
