@@ -1268,6 +1268,7 @@ async function callGeminiOAuthStream(contents, _retried) {
     const err = new Error(`CodeAssist API ${res.status}: ${errText.substring(0, 500)}`);
     if (res.status === 429) { err.status = 429; err.text = errText; }
     if (res.status === 404) { err.status = 404; }
+    if (res.status === 400 && errText.includes("thought_signature")) { err.status = 400; }
     throw err;
   }
 
@@ -1392,6 +1393,7 @@ async function callGeminiOAuthNonStream(contents, _retried) {
     const err = new Error(`CodeAssist API ${res.status}: ${errText.substring(0, 500)}`);
     if (res.status === 429) { err.status = 429; err.text = errText; }
     if (res.status === 404) { err.status = 404; }
+    if (res.status === 400 && errText.includes("thought_signature")) { err.status = 400; }
     throw err;
   }
 
@@ -1461,6 +1463,10 @@ function isRateLimitError(e) {
 
 function isModelNotFoundError(e) {
   return e?.status === 404 || (e?.message && /404.*[Nn]ot [Ff]ound/.test(e.message));
+}
+
+function isThoughtSignatureError(e) {
+  return e?.status === 400 || (e?.message && e.message.includes("thought_signature"));
 }
 
 let pendingRestore = null; // Model to restore on next successful call
@@ -1553,8 +1559,17 @@ async function callGemini(contents) {
         stopSpin();
         if (attempt === 0) process.stdout.write(`\x1b[90m  429: ${errText.substring(0, 200)}\x1b[0m\n`);
 
-        // Auto-fallback: immediately try fallback on first 429
-        if (attempt === 0) {
+        // If server says retry is short (≤5s), wait and retry same model instead of fallback
+        if (attempt === 0 && serverDelay > 0 && serverDelay <= 5) {
+          const retryMs = serverDelay * 1000 + 500;
+          process.stdout.write(`\x1b[33m  ! rate limit. server says ${serverDelay}s, waiting ${Math.ceil(retryMs / 1000)}s...\x1b[0m\n`);
+          startSpin(`retrying in ${Math.ceil(retryMs / 1000)}s...`);
+          await sleep(retryMs);
+          continue;
+        }
+
+        // Auto-fallback: try fallback when server delay is long or unspecified
+        if (attempt <= 1) {
           fallbackTried.add(getCurrentKey());
           const fallback = getModelFallback();
           if (fallback) {
@@ -1570,9 +1585,10 @@ async function callGemini(contents) {
           }
         }
 
-        process.stdout.write(`\x1b[33m  ! rate limit. waiting ${Math.ceil(waitMs / 1000)}s (attempt ${attempt + 1}/${MAX_ATTEMPTS})...\x1b[0m\n`);
-        startSpin(`retrying in ${Math.ceil(waitMs / 1000)}s...`);
-        await sleep(waitMs);
+        const retryWaitMs = serverDelay > 0 ? serverDelay * 1000 + 500 : waitMs;
+        process.stdout.write(`\x1b[33m  ! rate limit. waiting ${Math.ceil(retryWaitMs / 1000)}s (attempt ${attempt + 1}/${MAX_ATTEMPTS})...\x1b[0m\n`);
+        startSpin(`retrying in ${Math.ceil(retryWaitMs / 1000)}s...`);
+        await sleep(retryWaitMs);
         currentDelay = Math.min(MAX_DELAY, currentDelay * 2);
         continue;
       }
@@ -1595,6 +1611,32 @@ async function callGemini(contents) {
         }
         // No fallback available
         throw new Error(`${MODEL} is not available and no fallback model found.`);
+      }
+
+      // thought_signature 400 → strip signatures and retry, then fallback
+      if (isThoughtSignatureError(e)) {
+        stripThoughtSignatures(true);
+        if (attempt === 0) {
+          // First try: retry same model with signatures stripped
+          attempt = -1;
+          currentDelay = INITIAL_DELAY;
+          continue;
+        }
+        // Still failing → fallback to next model
+        fallbackTried.add(getCurrentKey());
+        const fallback = getModelFallback();
+        if (fallback) {
+          const { model: fbModel, auth: fbAuth } = parseModelAuth(fallback);
+          stopSpin();
+          process.stdout.write(`\x1b[33m  ! 400 thought_signature on ${getCurrentKey()} → ${fallback}\x1b[0m\n`);
+          pendingRestore = pendingRestore || getCurrentKey();
+          MODEL = fbModel;
+          forceAuth = fbAuth || null;
+          attempt = -1;
+          currentDelay = INITIAL_DELAY;
+          continue;
+        }
+        throw e;
       }
 
       // Network errors with exponential backoff (cap 30s)
@@ -1628,9 +1670,11 @@ function fmtArgs(args) {
 }
 
 // ====== Abort Cleanup ======
-function stripThoughtSignatures() {
+function stripThoughtSignatures(force = false) {
   // Remove thought/thoughtSignature from history entries.
-  // Different models reject foreign thought signatures with 400 INVALID_ARGUMENT.
+  // Different auth types (OAuth vs API key) reject foreign thought signatures with 400.
+  // Within the same auth type (e.g. OAuth→OAuth), signatures may be valid — skip stripping.
+  if (!force && forceAuth === "oauth") return;
   for (const msg of history) {
     if (!msg.parts) continue;
     for (const part of msg.parts) {
