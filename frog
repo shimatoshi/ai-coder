@@ -978,15 +978,19 @@ loadHooks();
 // ====== Abort Control ======
 let aborted = false;
 let agentRunning = false;
+let currentAbortController = null; // Abort in-flight fetch on Ctrl+C
 
 function setupSigintHandler() {
   let lastSigint = 0;
   process.on("SIGINT", () => {
     if (agentRunning) {
-      // During agent turn: set abort flag
+      // During agent turn: set abort flag and cancel in-flight fetch
       aborted = true;
+      if (currentAbortController) {
+        try { currentAbortController.abort(); } catch {}
+      }
       stopSpin();
-      process.stdout.write(`\n\x1b[33m  ⏹ Interrupted. Finishing current step...\x1b[0m\n`);
+      process.stdout.write(`\n\x1b[33m  ⏹ Interrupted.\x1b[0m\n`);
     } else {
       // During input: double Ctrl+C to exit
       const now = Date.now();
@@ -1046,15 +1050,24 @@ const MIN_INTERVAL = 1500;
 let lastApiCall = 0;
 
 function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
+  return new Promise((r, rej) => {
+    const timer = setTimeout(r, ms);
+    // Allow abort to cancel sleep
+    const check = setInterval(() => {
+      if (aborted) { clearTimeout(timer); clearInterval(check); rej(new Error("Aborted by user")); }
+    }, 200);
+    setTimeout(() => clearInterval(check), ms);
+  });
 }
 
 function fetchWithTimeout(url, options, timeoutMs = 60000) {
   const controller = new AbortController();
+  currentAbortController = controller;
   const timer = setTimeout(() => controller.abort(), timeoutMs);
-  return fetch(url, { ...options, signal: controller.signal }).finally(() =>
-    clearTimeout(timer)
-  );
+  return fetch(url, { ...options, signal: controller.signal }).finally(() => {
+    clearTimeout(timer);
+    if (currentAbortController === controller) currentAbortController = null;
+  });
 }
 
 async function rateLimitWait() {
@@ -1284,11 +1297,12 @@ async function callGeminiOAuthStream(contents, _retried) {
     let buffer = "";
 
     while (true) {
+      if (aborted) break;
       let readResult;
       try {
         readResult = await reader.read();
       } catch (readErr) {
-        // Stream read error - use what we have so far
+        // Stream read error (including abort) - use what we have so far
         break;
       }
 
@@ -1506,6 +1520,7 @@ async function callGemini(contents) {
   let currentDelay = INITIAL_DELAY;
 
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    if (aborted) throw new Error("Aborted by user");
     try {
       let result;
       const useOAuth = forceAuth === "oauth" ? true : forceAuth === "apikey" ? false : isOAuthEnabled();
@@ -1640,6 +1655,8 @@ async function callGemini(contents) {
       }
 
       // Network errors with exponential backoff (cap 30s)
+      // Don't retry if user aborted
+      if (aborted) throw new Error("Aborted by user");
       if (isNetworkError(e) && attempt < MAX_ATTEMPTS - 1) {
         const jitter = currentDelay * 0.3 * (Math.random() * 2 - 1);
         const waitMs = Math.max(0, currentDelay + jitter);
@@ -1741,9 +1758,16 @@ async function agentTurn(userMessage) {
     let response;
     try {
       response = await callGemini(history);
-    } finally {
+    } catch (e) {
       stopSpin();
+      if (aborted) {
+        cleanupHistoryAfterAbort();
+        process.stdout.write(`\x1b[33m  ⏹ Turn aborted by user.\x1b[0m\n`);
+        return "";
+      }
+      throw e;
     }
+    stopSpin();
 
     history.push(response);
 
@@ -2359,7 +2383,9 @@ async function main() {
       else console.log("");
       compactHistory();
     } catch (e) {
-      console.error(`\x1b[31mError: ${e.message}\x1b[0m\n`);
+      if (!aborted) {
+        console.error(`\x1b[31mError: ${e.message}\x1b[0m\n`);
+      }
     } finally {
       agentRunning = false;
       aborted = false;
