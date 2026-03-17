@@ -3,7 +3,7 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-FROG="$SCRIPT_DIR/frog"
+FROG="$SCRIPT_DIR/frog-pkg/bin/frog"
 DEST="${HOME}/.local/bin/frog"
 
 if [ ! -f "$FROG" ]; then

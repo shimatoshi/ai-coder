@@ -1,0 +1,9 @@
+{
+  "name": "frog",
+  "version": "0.6.0",
+  "type": "module",
+  "bin": {
+    "frog": "./bin/frog"
+  },
+  "description": "Coding agent for Termux. Zero dependencies. Gemini OAuth + API key."
+}

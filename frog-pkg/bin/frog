@@ -1,0 +1,245 @@
+#!/usr/bin/env node
+// ============================================
+// frog - coding agent for Termux
+// Zero dependencies. Gemini OAuth + API key.
+// ============================================
+
+import { writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import state from "../src/state.js";
+import { loadEnv, loadAuth, AVAILABLE_MODELS, AUTH_FILE } from "../src/config.js";
+import { startOAuthLogin, configureApiKey, isOAuthEnabled } from "../src/auth.js";
+import { agentTurn, toolSpawnAgent } from "../src/agent.js";
+import { compactHistory } from "../src/api.js";
+import { loadHooks, runSessionStartHooks } from "../src/hooks.js";
+import { readUserInput } from "../src/input.js";
+import { titleIdle, titleThinking, titleDone, stopSpin } from "../src/ui.js";
+import { TOOL_MAP } from "../src/tools.js";
+
+// ====== Package root ======
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const ROOT_DIR = join(__dirname, "..");
+
+// ====== Bootstrap ======
+loadEnv(ROOT_DIR);
+// Re-read env after loading .env
+state.API_KEY = process.env.GEMINI_API_KEY || "";
+state.MODEL = process.env.AGENT_MODEL || "gemini-3-flash-preview";
+state.authTokens = loadAuth();
+
+// Register spawn_agent into TOOL_MAP (breaks circular dep: tools ↔ api)
+TOOL_MAP.spawn_agent = toolSpawnAgent;
+
+// Load hooks
+loadHooks();
+
+// ====== SIGINT Handler ======
+function setupSigintHandler() {
+  let lastSigint = 0;
+  process.on("SIGINT", () => {
+    if (state.agentRunning) {
+      state.aborted = true;
+      if (state.currentAbortController) {
+        try { state.currentAbortController.abort(); } catch {}
+      }
+      stopSpin();
+      process.stdout.write(`\n\x1b[33m  ⏹ Interrupted.\x1b[0m\n`);
+    } else {
+      const now = Date.now();
+      if (now - lastSigint < 500) {
+        console.log("\n\x1b[90mBye.\x1b[0m");
+        process.exit(0);
+      }
+      lastSigint = now;
+      process.stdout.write(`\n\x1b[90m(Ctrl+C again to exit)\x1b[0m\n`);
+    }
+  });
+}
+
+// ====== Commands ======
+function showHelp() {
+  console.log(`\x1b[36m
+入力:
+  Enter     改行
+  Ctrl+D    送信
+
+Commands:
+  /login    Googleアカウントで認証（1000回/日）
+  /api      Gemini APIキーを設定
+  /logout   認証情報を削除
+  /status   認証状態を表示
+  /clear    会話履歴をクリア
+  /compact  履歴を圧縮（トークン節約）
+  /history  履歴の状態を表示
+  /safety   安全モード切替 (off/confirm/blocklist)
+  /model    モデル切り替え (引数なしでサイクル、/model pro で部分一致)
+  /help     このヘルプを表示
+  Enter×2   送信
+  Ctrl+D    送信（代替）
+  Ctrl+C    終了
+\x1b[0m`);
+}
+
+function showStatus() {
+  if (isOAuthEnabled()) {
+    const remaining = Math.max(0, Math.floor((state.authTokens.expires_at - Date.now()) / 60000));
+    console.log(`\x1b[32mOAuth: Active\x1b[0m`);
+    console.log(`\x1b[90mAccount: ${state.authTokens.email || "unknown"}`);
+    console.log(`Token expires in: ${remaining} min`);
+    console.log(`Endpoint: Code Assist (1000 RPD)\x1b[0m`);
+  } else if (state.API_KEY) {
+    console.log(`\x1b[33mAPI Key: Active\x1b[0m`);
+    console.log(`\x1b[90mEndpoint: Standard API (20 RPD per model)\x1b[0m`);
+    console.log(`\x1b[90m/login でOAuth認証すると1000回/日に増えます\x1b[0m`);
+  } else {
+    console.log(`\x1b[31mNot authenticated\x1b[0m`);
+    console.log(`\x1b[90m/login でGoogleアカウント認証してください\x1b[0m`);
+  }
+  console.log(`\x1b[90mCurrent model: ${state.MODEL}\x1b[0m`);
+}
+
+// ====== Main ======
+async function main() {
+  console.log(`\x1b[36m🐸 frog v0.6\x1b[0m`);
+  console.log(`\x1b[90mModel: ${state.MODEL} | Dir: ${state.CWD}\x1b[0m`);
+
+  if (isOAuthEnabled()) {
+    console.log(`\x1b[32mOAuth: ${state.authTokens.email || "authenticated"}\x1b[0m`);
+  } else if (state.API_KEY) {
+    console.log(`\x1b[33mAPI Key mode (制限あり). /login でOAuth認証推奨\x1b[0m`);
+  } else {
+    console.log(`\x1b[31m認証なし. /login でGoogleアカウント認証してください\x1b[0m`);
+  }
+
+  console.log(`\x1b[90mEnter=改行 Enter×2=送信 /help=コマンド一覧\x1b[0m\n`);
+  titleIdle();
+
+  await runSessionStartHooks();
+  if (state.sessionStartContext) {
+    process.stdout.write(`\x1b[90m  hooks: SessionStart context loaded\x1b[0m\n`);
+  }
+
+  while (true) {
+    const input = (await readUserInput()).trim();
+    if (!input) continue;
+
+    if (input === "/login") {
+      try { await startOAuthLogin(); } catch (e) {
+        console.error(`\x1b[31mLogin failed: ${e.message}\x1b[0m\n`);
+      }
+      continue;
+    }
+    if (input === "/api") {
+      await configureApiKey(ROOT_DIR);
+      continue;
+    }
+    if (input === "/logout") {
+      state.authTokens = null;
+      try { writeFileSync(AUTH_FILE, "{}", "utf-8"); } catch {}
+      console.log("\x1b[90mLogged out.\x1b[0m");
+      continue;
+    }
+    if (input === "/status") { showStatus(); continue; }
+    if (input === "/clear") { state.history = []; state.turnCount = 0; console.log("\x1b[90mCleared.\x1b[0m"); continue; }
+    if (input === "/compact") {
+      if (compactHistory()) console.log(`\x1b[90mCompacted. ${state.history.length} msgs.\x1b[0m`);
+      else console.log(`\x1b[90mAlready small (${state.history.length} msgs).\x1b[0m`);
+      continue;
+    }
+    if (input === "/history") {
+      const tc = state.history.filter((m) => m.parts?.some((p) => p.functionCall)).length;
+      console.log(`\x1b[90mMessages: ${state.history.length} | Tool calls: ${tc} | Turns: ${state.turnCount}\x1b[0m`);
+      continue;
+    }
+    if (input.startsWith("/model")) {
+      const arg = input.split(/\s+/)[1];
+      if (arg) {
+        const match = AVAILABLE_MODELS.find(m => m.includes(arg));
+        if (match) {
+          state.MODEL = match;
+          console.log(`\x1b[90mModel: ${state.MODEL}\x1b[0m`);
+        } else {
+          console.log(`\x1b[31mUnknown: ${arg}\x1b[0m`);
+        }
+      } else {
+        AVAILABLE_MODELS.forEach((m, i) => console.log(`\x1b[90m  ${i + 1}. ${m}${m === state.MODEL ? " \x1b[32m(current)\x1b[90m" : ""}\x1b[0m`));
+        const choice = await new Promise((res) => {
+          process.stdout.write(`\x1b[33m  番号: \x1b[0m`);
+          process.stdin.setRawMode(true);
+          process.stdin.resume();
+          process.stdin.once("data", (data) => {
+            process.stdin.setRawMode(false);
+            process.stdin.pause();
+            const ch = data.toString().trim();
+            process.stdout.write(ch + "\n");
+            res(ch);
+          });
+        });
+        const idx = parseInt(choice) - 1;
+        if (idx >= 0 && idx < AVAILABLE_MODELS.length) {
+          state.MODEL = AVAILABLE_MODELS[idx];
+          console.log(`\x1b[90mModel: ${state.MODEL}\x1b[0m`);
+        } else {
+          console.log(`\x1b[90m変更なし\x1b[0m`);
+        }
+      }
+      continue;
+    }
+    if (input.startsWith("/safety")) {
+      const arg = input.split(/\s+/)[1];
+      const SAFETY_MODES = ["blocklist", "confirm", "off"];
+      const labels = { off: "\x1b[31mOFF (全許可)", confirm: "\x1b[33mCONFIRM (毎回確認)", blocklist: "\x1b[32mBLOCKLIST (危険コマンドのみ確認)" };
+      if (arg && SAFETY_MODES.includes(arg)) {
+        state.safetyMode = arg;
+      } else {
+        SAFETY_MODES.forEach((m, i) => console.log(`\x1b[90m  ${i + 1}. ${labels[m]}${m === state.safetyMode ? " \x1b[90m(current)" : ""}\x1b[0m`));
+        const choice = await new Promise((res) => {
+          process.stdout.write(`\x1b[33m  番号: \x1b[0m`);
+          process.stdin.setRawMode(true);
+          process.stdin.resume();
+          process.stdin.once("data", (data) => {
+            process.stdin.setRawMode(false);
+            process.stdin.pause();
+            const ch = data.toString().trim();
+            process.stdout.write(ch + "\n");
+            res(ch);
+          });
+        });
+        const idx = parseInt(choice) - 1;
+        if (idx >= 0 && idx < SAFETY_MODES.length) {
+          state.safetyMode = SAFETY_MODES[idx];
+        } else {
+          console.log(`\x1b[90m変更なし\x1b[0m`);
+          continue;
+        }
+      }
+      console.log(`\x1b[90mSafety: ${labels[state.safetyMode]}\x1b[0m`);
+      continue;
+    }
+    if (input === "/help") { showHelp(); continue; }
+
+    // Agent turn
+    try {
+      state.agentRunning = true;
+      state.aborted = false;
+      titleThinking();
+      const res = await agentTurn(input);
+      titleDone();
+      if (res) console.log(`\n${res}\n`);
+      else console.log("");
+      compactHistory();
+    } catch (e) {
+      if (!state.aborted) {
+        console.error(`\x1b[31mError: ${e.message}\x1b[0m\n`);
+      }
+    } finally {
+      state.agentRunning = false;
+      state.aborted = false;
+      setTimeout(titleIdle, 2000);
+    }
+  }
+}
+
+setupSigintHandler();
+main();
