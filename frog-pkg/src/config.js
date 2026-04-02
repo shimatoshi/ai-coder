@@ -32,7 +32,8 @@ export const CODE_ASSIST_ENDPOINT = process.env.FROG_OAUTH_URL || "https://cloud
 
 export function getCodeAssistHeaders() {
   return {
-    "User-Agent": `GeminiCLI/0.31.0/${state.MODEL} (${process.platform}; ${process.arch})`,
+    "User-Agent": `GeminiCLI/0.36.0/${state.MODEL} (${process.platform}; ${process.arch}; cli)`,
+    "x-goog-api-client": "gax-js/4.2.2 gl-node/22.0.0",
   };
 }
 

@@ -5,7 +5,7 @@ import {
   saveAuth, getSystemPrompt,
 } from "./config.js";
 import { ensureValidToken, refreshAccessToken, isOAuthEnabled } from "./auth.js";
-import { fetchWithTimeout, sleep, rateLimitWait } from "./net.js";
+import { fetchWithTimeout, fetchWithRetry, sleep, rateLimitWait } from "./net.js";
 import {
   parseRetryDelay, isTerminalQuota, isNetworkError, isRateLimitError,
   isModelNotFoundError, isThoughtSignatureError,
@@ -26,7 +26,7 @@ import { tools } from "./tools.js";
 export async function initProject() {
   if (state.authTokens.project_id) return;
 
-  const res = await fetchWithTimeout(
+  const res = await fetchWithRetry(
     `${CODE_ASSIST_ENDPOINT}/v1internal:loadCodeAssist`,
     {
       method: "POST",
@@ -35,7 +35,13 @@ export async function initProject() {
         Authorization: `Bearer ${state.authTokens.access_token}`,
         ...getCodeAssistHeaders(),
       },
-      body: "{}",
+      body: JSON.stringify({
+        metadata: {
+          ideType: "IDE_UNSPECIFIED",
+          platform: "PLATFORM_UNSPECIFIED",
+          pluginType: "GEMINI",
+        },
+      }),
     },
     15000
   );
@@ -77,7 +83,6 @@ export async function callGeminiOAuthStream(contents, _retried) {
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${state.authTokens.access_token}`,
-        Accept: "text/event-stream",
         ...getCodeAssistHeaders(),
       },
       body: JSON.stringify(body),
@@ -192,7 +197,7 @@ export async function callGeminiOAuthNonStream(contents, _retried) {
     },
   };
 
-  const res = await fetchWithTimeout(
+  const res = await fetchWithRetry(
     `${CODE_ASSIST_ENDPOINT}/v1internal:generateContent`,
     {
       method: "POST",
@@ -250,7 +255,7 @@ async function callGeminiApiKey(contents) {
     body.generationConfig.thinkingConfig = { thinkingBudget: 8192 };
   }
 
-  const res = await fetchWithTimeout(
+  const res = await fetchWithRetry(
     `${STANDARD_API_URL}/models/${state.MODEL}:generateContent?key=${state.API_KEY}`,
     {
       method: "POST",
@@ -413,7 +418,8 @@ export async function callGemini(contents) {
     }
   }
 
-  const MAX_ATTEMPTS = 7;
+  // Match official Gemini CLI: 10 attempts, 5s initial, 30s max, exponential backoff
+  const MAX_ATTEMPTS = 10;
   const INITIAL_DELAY = 5000;
   const MAX_DELAY = 30000;
 
@@ -437,6 +443,7 @@ export async function callGemini(contents) {
       if (isRateLimitError(e)) {
         const errText = typeof e.text === "string" ? e.text : e.message || "";
 
+        // Terminal quota (daily limit): fall back to different model immediately
         if (isTerminalQuota(errText)) {
           state.fallbackTried.add(getCurrentKey());
           const flash = getFlashFallback();
@@ -456,38 +463,15 @@ export async function callGemini(contents) {
           throw new Error(`日次クォータ超過 (${state.MODEL}). しばらく待ってから再試行してください。`);
         }
 
+        // Retryable 429: exponential backoff, respect server delay (like official CLI)
         if (attempt >= MAX_ATTEMPTS - 1) {
-          throw new Error(`Rate limit exceeded. しばらく待ってから再試行してください。`);
-        }
-
-        const serverDelay = parseRetryDelay(errText);
-        let waitMs;
-        if (serverDelay > 0) {
-          waitMs = serverDelay * 1000 + currentDelay * 0.2 * Math.random();
-          currentDelay = Math.max(currentDelay, serverDelay * 1000);
-        } else {
-          const jitter = currentDelay * 0.3 * (Math.random() * 2 - 1);
-          waitMs = Math.max(0, currentDelay + jitter);
-        }
-
-        stopSpin();
-        if (attempt === 0) process.stdout.write(`\x1b[90m  429: ${errText.substring(0, 200)}\x1b[0m\n`);
-
-        // Short reset (≤10s): wait and retry up to 3 times before falling back
-        if (attempt < 3 && serverDelay > 0 && serverDelay <= 10) {
-          const retryMs = serverDelay * 1000 + 1500;
-          process.stdout.write(`\x1b[33m  ! rate limit. server says ${serverDelay}s, waiting ${Math.ceil(retryMs / 1000)}s (attempt ${attempt + 1})...\x1b[0m\n`);
-          startSpin(`retrying in ${Math.ceil(retryMs / 1000)}s...`);
-          await sleep(retryMs);
-          continue;
-        }
-
-        if (attempt <= 3) {
+          // Last resort: try fallback before giving up
           state.fallbackTried.add(getCurrentKey());
           const fallback = getModelFallback();
           if (fallback) {
             const { model: fbModel, auth: fbAuth } = parseModelAuth(fallback);
-            process.stdout.write(`\x1b[33m  ! 429 on ${getCurrentKey()} → ${fallback}\x1b[0m\n`);
+            stopSpin();
+            process.stdout.write(`\x1b[33m  ! 429 exhausted retries on ${getCurrentKey()} → ${fallback}\x1b[0m\n`);
             state.pendingRestore = state.pendingRestore || getCurrentKey();
             state.MODEL = fbModel;
             state.forceAuth = fbAuth || null;
@@ -496,12 +480,24 @@ export async function callGemini(contents) {
             currentDelay = INITIAL_DELAY;
             continue;
           }
+          throw new Error(`Rate limit exceeded. しばらく待ってから再試行してください。`);
         }
 
-        const retryWaitMs = serverDelay > 0 ? serverDelay * 1000 + 500 : waitMs;
-        process.stdout.write(`\x1b[33m  ! rate limit. waiting ${Math.ceil(retryWaitMs / 1000)}s (attempt ${attempt + 1}/${MAX_ATTEMPTS})...\x1b[0m\n`);
-        startSpin(`retrying in ${Math.ceil(retryWaitMs / 1000)}s...`);
-        await sleep(retryWaitMs);
+        const serverDelay = parseRetryDelay(errText);
+        let waitMs;
+        if (serverDelay > 0) {
+          // Server told us when to retry — use it with small positive jitter
+          waitMs = serverDelay * 1000 + serverDelay * 200 * Math.random();
+        } else {
+          // No server hint — exponential backoff with ±30% jitter
+          const jitter = currentDelay * 0.3 * (Math.random() * 2 - 1);
+          waitMs = Math.max(1000, currentDelay + jitter);
+        }
+
+        stopSpin();
+        if (attempt === 0) process.stdout.write(`\x1b[90m  429: retrying...${serverDelay > 0 ? ` (server: ${serverDelay}s)` : ""}\x1b[0m\n`);
+        startSpin(`retry ${attempt + 1}/${MAX_ATTEMPTS} in ${Math.ceil(waitMs / 1000)}s...`);
+        await sleep(waitMs);
         currentDelay = Math.min(MAX_DELAY, currentDelay * 2);
         continue;
       }
