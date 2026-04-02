@@ -119,16 +119,26 @@ export function getCurrentKey() {
   return state.forceAuth ? `${state.MODEL}@${state.forceAuth}` : state.MODEL;
 }
 
+// Check if a model (any auth variant) has been tried
+function isModelTried(candidate) {
+  if (state.fallbackTried.has(candidate)) return true;
+  // Also check if the same model with a different auth suffix (or bare) was tried
+  const { model } = parseModelAuth(candidate);
+  if (state.fallbackTried.has(model)) return true;
+  if (state.fallbackTried.has(model + "@oauth")) return true;
+  if (state.fallbackTried.has(model + "@apikey")) return true;
+  return false;
+}
+
 export function getModelFallback() {
   const key = getCurrentKey();
   const chain = MODEL_FALLBACK_CHAIN[key] || MODEL_FALLBACK_CHAIN[state.MODEL] || [];
   for (const candidate of chain) {
-    if (!state.fallbackTried.has(candidate)) {
-      const { auth } = parseModelAuth(candidate);
-      if (auth === "oauth" && !isOAuthEnabled()) continue;
-      if (auth === "apikey" && !state.API_KEY) continue;
-      return candidate;
-    }
+    if (isModelTried(candidate)) continue;
+    const { auth } = parseModelAuth(candidate);
+    if (auth === "oauth" && !isOAuthEnabled()) continue;
+    if (auth === "apikey" && !state.API_KEY) continue;
+    return candidate;
   }
   return null;
 }
