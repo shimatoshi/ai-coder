@@ -22,7 +22,6 @@ const state = {
   spinTimer: null,
   spinIdx: 0,
   sessionId: null,
-  lastRateLimitAt: null,
 };
 
 export default state;

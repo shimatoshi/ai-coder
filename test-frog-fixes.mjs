@@ -30,33 +30,21 @@ function isModelNotFoundError(e) {
   return e?.status === 404 || (e?.message && /404.*[Nn]ot [Ff]ound/.test(e.message));
 }
 
-// Matches the FIXED stripThoughtSignatures (with convertTools support)
-function stripThoughtSignatures(history, force, forceAuth, MODEL, convertTools = false) {
+// Matches the current stripThoughtSignatures (with synthetic signature injection)
+const SYNTHETIC_THOUGHT_SIGNATURE = "skip_thought_signature_validator";
+
+function stripThoughtSignatures(history, force, forceAuth, MODEL) {
   if (!force && (forceAuth === "oauth" || THINKING_MODELS.test(MODEL))) return;
   for (const msg of history) {
     if (!msg.parts) continue;
-    for (let i = 0; i < msg.parts.length; i++) {
-      const part = msg.parts[i];
+    for (const part of msg.parts) {
       if (!force && part.functionCall) continue; // same-model: preserve functionCall sigs
-
-      // Cross-auth switch: convert functionCall to text to avoid signature catch-22
-      if (convertTools && part.functionCall) {
-        const fc = part.functionCall;
-        const argStr = fc.args ? JSON.stringify(fc.args) : "{}";
-        const summary = argStr.length > 200 ? argStr.substring(0, 200) + "..." : argStr;
-        msg.parts[i] = { text: `[Tool call: ${fc.name}(${summary})]` };
-        continue;
-      }
-      if (convertTools && part.functionResponse) {
-        const fr = part.functionResponse;
-        const resStr = fr.response ? JSON.stringify(fr.response) : "";
-        const summary = resStr.length > 500 ? resStr.substring(0, 500) + "..." : resStr;
-        msg.parts[i] = { text: `[Tool result: ${fr.name}: ${summary}]` };
-        continue;
-      }
-
       if (part.thought) { delete part.thought; }
       if (part.thoughtSignature) { delete part.thoughtSignature; }
+      // Inject synthetic signature on functionCall parts so API accepts them
+      if (force && part.functionCall) {
+        part.thoughtSignature = SYNTHETIC_THOUGHT_SIGNATURE;
+      }
     }
     msg.parts = msg.parts.filter((p) => p.text || p.functionCall || p.functionResponse || p.thoughtSignature);
   }
@@ -140,7 +128,7 @@ console.log("\n\x1b[1m=== stripThoughtSignatures: force=true (model switch) ===\
 
   const fcPart = modelParts.find(p => p.functionCall);
   assert(fcPart !== undefined, "functionCall part preserved");
-  assert(!fcPart.thoughtSignature, "functionCall sig STRIPPED (foreign model's sig)");
+  assert(fcPart.thoughtSignature === SYNTHETIC_THOUGHT_SIGNATURE, "functionCall gets synthetic signature");
 }
 
 {
@@ -219,21 +207,23 @@ console.log("\n\x1b[1m=== Integration: OAuth→OAuth model switch ===\x1b[0m\n")
   // prepareModelSwitch → stripThoughtSignatures(true)
   stripThoughtSignatures(history, true, "oauth", "gemini-3-pro-preview");
 
-  let sigCount = 0;
+  let origSigCount = 0;
+  let syntheticCount = 0;
   for (const msg of history) {
     for (const part of msg.parts || []) {
-      if (part.thoughtSignature) sigCount++;
+      if (part.thoughtSignature === SYNTHETIC_THOUGHT_SIGNATURE) syntheticCount++;
+      else if (part.thoughtSignature) origSigCount++;
     }
   }
-  assert(sigCount === 0, "ALL signatures removed (including functionCall)");
+  assert(origSigCount === 0, "ALL original signatures removed");
   assert(history.length === 4, "all messages preserved");
 
   const fc = history[1].parts.find(p => p.functionCall);
   assert(fc && fc.functionCall.name === "writeFile", "functionCall data intact");
-  assert(!fc.thoughtSignature, "functionCall sig gone → no 400 on new model");
+  assert(fc.thoughtSignature === SYNTHETIC_THOUGHT_SIGNATURE, "functionCall gets synthetic sig");
 }
 
-console.log("\n\x1b[1m=== Integration: OAuth→APIkey model switch (no convertTools) ===\x1b[0m\n");
+console.log("\n\x1b[1m=== Integration: OAuth→APIkey with synthetic signature ===\x1b[0m\n");
 
 {
   const history = [
@@ -248,51 +238,17 @@ console.log("\n\x1b[1m=== Integration: OAuth→APIkey model switch (no convertTo
     ]},
   ];
 
-  // force=true but convertTools=false (same auth type switch)
-  stripThoughtSignatures(history, true, "apikey", "gemini-2.5-flash", false);
+  stripThoughtSignatures(history, true, "apikey", "gemini-2.5-flash");
 
   const fc = history[1].parts.find(p => p.functionCall);
-  assert(!fc.thoughtSignature, "OAuth→APIkey: functionCall sig stripped");
+  assert(fc.thoughtSignature === SYNTHETIC_THOUGHT_SIGNATURE, "OAuth→APIkey: synthetic sig injected");
   assert(fc.functionCall.name === "ls", "functionCall data intact");
+  // functionResponse should be untouched (no signature needed)
+  const fr = history[2].parts.find(p => p.functionResponse);
+  assert(fr, "functionResponse preserved");
 }
 
-console.log("\n\x1b[1m=== Integration: OAuth→APIkey with convertTools (cross-auth) ===\x1b[0m\n");
-
-{
-  const history = [
-    { role: "user", parts: [{ text: "help" }] },
-    { role: "model", parts: [
-      { thought: true, text: "thinking", thoughtSignature: "oauth_sig" },
-      { text: "done" },
-      { functionCall: { name: "list_directory", args: { path: "src" } }, thoughtSignature: "oauth_fc_sig" },
-    ]},
-    { role: "user", parts: [
-      { functionResponse: { name: "list_directory", response: { files: ["a.js", "b.js"] } } },
-    ]},
-  ];
-
-  // convertTools=true: functionCall/functionResponse become text summaries
-  stripThoughtSignatures(history, true, "apikey", "gemini-3-flash-preview", true);
-
-  // No functionCall parts should remain
-  const allParts = history.flatMap(m => m.parts || []);
-  assert(!allParts.some(p => p.functionCall), "convertTools: no functionCall parts remain");
-  assert(!allParts.some(p => p.functionResponse), "convertTools: no functionResponse parts remain");
-
-  // Should have text summaries instead
-  const toolCallText = allParts.find(p => p.text?.includes("[Tool call:"));
-  assert(toolCallText, "convertTools: functionCall converted to text summary");
-  assert(toolCallText.text.includes("list_directory"), "convertTools: tool name preserved in summary");
-
-  const toolResultText = allParts.find(p => p.text?.includes("[Tool result:"));
-  assert(toolResultText, "convertTools: functionResponse converted to text summary");
-
-  // Thought/signature should also be stripped
-  assert(!allParts.some(p => p.thought), "convertTools: thoughts also stripped");
-  assert(!allParts.some(p => p.thoughtSignature), "convertTools: signatures also stripped");
-}
-
-console.log("\n\x1b[1m=== Integration: OAuth→OAuth (same auth, no convertTools) ===\x1b[0m\n");
+console.log("\n\x1b[1m=== Integration: model switch preserves functionCall with synthetic sig ===\x1b[0m\n");
 
 {
   const history = [
@@ -305,13 +261,12 @@ console.log("\n\x1b[1m=== Integration: OAuth→OAuth (same auth, no convertTools
     ]},
   ];
 
-  // Same auth (oauth→oauth), just model switch: should NOT convert tools
-  stripThoughtSignatures(history, true, "oauth", "gemini-3-pro-preview", false);
+  stripThoughtSignatures(history, true, "oauth", "gemini-3-pro-preview");
 
   const fc = history[1].parts.find(p => p.functionCall);
-  assert(fc, "OAuth→OAuth: functionCall preserved (same auth, no convert)");
-  assert(!fc.thoughtSignature, "OAuth→OAuth: signature stripped");
-  assert(fc.functionCall.name === "read_file", "OAuth→OAuth: functionCall data intact");
+  assert(fc, "functionCall preserved");
+  assert(fc.thoughtSignature === SYNTHETIC_THOUGHT_SIGNATURE, "synthetic sig replaces original");
+  assert(fc.functionCall.name === "read_file", "functionCall data intact");
 }
 
 // ============================================================
